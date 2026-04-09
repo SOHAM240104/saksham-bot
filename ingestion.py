@@ -9,7 +9,7 @@ Features:
     ingest_excel(...)
     ingest_pdf(...)
 - Shared pipeline:
-    fetch/extract -> clean -> semantic chunk -> embed -> append to pgvector
+    fetch/extract -> clean -> semantic chunk -> append with SQLAlchemy
 - Basic URL dedup: skip if URL already exists in sources table
 - Append-only writes for chunks
 
@@ -18,7 +18,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import json
 import os as os_module
 import re
 from dataclasses import dataclass
@@ -29,15 +28,16 @@ import pandas as pd
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from pgvector.psycopg import register_vector
-import psycopg
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from openai import OpenAI
+from sqlalchemy.orm import Session
+
+from config.database import Base, SessionLocal
+from models.ingestion_records import ChunkModel, IngestionUsageModel, SourceModel
 
 load_dotenv()
 
-EMBEDDING_DIM = 1536
 EMBEDDING_MODEL = "text-embedding-3-small"
 # OpenAI price for text-embedding-3-small is $0.00002 per 1K tokens.
 EMBEDDING_COST_PER_1K_TOKENS_USD = 0.00002
@@ -183,145 +183,59 @@ def _extract_pdf_markdown_docling(file_path: str) -> str:
     return str(doc)
 
 
-def _connect() -> psycopg.Connection:
-    db_url = _require_env("DATABASE_URL")
-    conn = psycopg.connect(db_url, autocommit=True)
-    return conn
+def _bootstrap_db(db: Session) -> None:
+    Base.metadata.create_all(bind=db.get_bind())
 
 
-def _bootstrap_db(conn: psycopg.Connection) -> None:
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS sources (
-                id BIGSERIAL PRIMARY KEY,
-                source TEXT NOT NULL UNIQUE,
-                type TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                os TEXT NOT NULL,
-                version TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS chunks (
-                id BIGSERIAL PRIMARY KEY,
-                source_id BIGINT NOT NULL REFERENCES sources(id) ON DELETE RESTRICT,
-                text TEXT NOT NULL,
-                embedding VECTOR({EMBEDDING_DIM}) NOT NULL,
-                metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb
-            );
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source_id ON chunks (source_id);")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ingestion_usage (
-                id BIGSERIAL PRIMARY KEY,
-                source TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                os TEXT NOT NULL,
-                version TEXT NOT NULL,
-                processed INTEGER NOT NULL DEFAULT 0,
-                skipped INTEGER NOT NULL DEFAULT 0,
-                failed INTEGER NOT NULL DEFAULT 0,
-                chunks INTEGER NOT NULL DEFAULT 0,
-                tokens_used INTEGER NOT NULL DEFAULT 0,
-                estimated_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-        cur.execute(
-            "ALTER TABLE ingestion_usage ADD COLUMN IF NOT EXISTS estimated_cost DOUBLE PRECISION NOT NULL DEFAULT 0;"
-        )
-    register_vector(conn)
-
-
-def _url_exists(conn: psycopg.Connection, url: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM sources
-            WHERE type = 'url' AND source = %s
-            LIMIT 1;
-            """,
-            (url,),
-        )
-        return cur.fetchone() is not None
+def _url_exists(db: Session, url: str) -> bool:
+    return db.query(SourceModel.id).filter(SourceModel.type == "url", SourceModel.source == url).first() is not None
 
 
 def _insert_source(
-    conn: psycopg.Connection,
+    db: Session,
     source: str,
     source_type: str,
     platform: str,
     os_name: str,
     version: str,
 ) -> int:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO sources (source, type, platform, os, version)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (source) DO NOTHING
-            RETURNING id;
-            """,
-            (source, source_type, platform, os_name, version),
-        )
-        row = cur.fetchone()
-        if row:
-            return int(row[0])
+    existing = db.query(SourceModel).filter(SourceModel.source == source).first()
+    if existing is not None:
+        return int(existing.id)
 
-        cur.execute(
-            """
-            SELECT id
-            FROM sources
-            WHERE source = %s
-            LIMIT 1;
-            """,
-            (source,),
-        )
-        return int(cur.fetchone()[0])
+    row = SourceModel(
+        source=source,
+        type=source_type,
+        platform=platform,
+        os=os_name,
+        version=version,
+    )
+    db.add(row)
+    db.flush()
+    return int(row.id)
 
 
-def _insert_chunks(conn: psycopg.Connection, source_id: int, docs: Iterable[Document]) -> Tuple[int, int, float]:
+def _insert_chunks(db: Session, source_id: int, docs: Iterable[Document]) -> Tuple[int, int, float]:
     docs_list = list(docs)
     if not docs_list:
         return 0, 0, 0.0
-
-    texts = [d.page_content for d in docs_list]
+    texts = [doc.page_content for doc in docs_list]
     vectors, tokens_used, cost_usd = _embed_texts_with_usage(texts)
-
-    rows = []
     for doc, vector in zip(docs_list, vectors):
         metadata = {
             "title": (doc.metadata or {}).get("title", "untitled"),
             "header": (doc.metadata or {}).get("header", ""),
         }
-        rows.append(
-            (
-                source_id,
-                doc.page_content,
-                vector,
-                json.dumps(metadata),
+        db.add(
+            ChunkModel(
+                source_id=source_id,
+                text=doc.page_content,
+                embedding=vector,
+                metadata=metadata,
             )
         )
-
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO chunks (source_id, text, embedding, metadata)
-            VALUES (%s, %s, %s, %s::jsonb);
-            """,
-            rows,
-        )
-    return len(rows), tokens_used, cost_usd
+    db.commit()
+    return len(docs_list), tokens_used, cost_usd
 
 
 def _embed_texts_with_usage(texts: List[str]) -> Tuple[List[List[float]], int, float]:
@@ -340,7 +254,7 @@ def _infer_source_type(source: str) -> str:
 
 
 def _log_usage(
-    conn: psycopg.Connection,
+    db: Session,
     source: str,
     source_type: str,
     platform: str,
@@ -353,31 +267,26 @@ def _log_usage(
     tokens_used: int,
     cost_usd: float,
 ) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO ingestion_usage
-            (source, source_type, platform, os, version, processed, skipped, failed, chunks, tokens_used, estimated_cost)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """,
-            (
-                source,
-                source_type,
-                platform,
-                os_name,
-                version,
-                processed,
-                skipped,
-                failed,
-                chunks,
-                tokens_used,
-                cost_usd,
-            ),
+    db.add(
+        IngestionUsageModel(
+            source=source,
+            source_type=source_type,
+            platform=platform,
+            os=os_name,
+            version=version,
+            processed=processed,
+            skipped=skipped,
+            failed=failed,
+            chunks=chunks,
+            tokens_used=tokens_used,
+            estimated_cost=cost_usd,
         )
+    )
+    db.commit()
 
 
 def process_source(
-    conn: psycopg.Connection,
+    db: Session,
     source: str,
     text: str,
     platform: str,
@@ -389,7 +298,7 @@ def process_source(
         return 0, 0, 0.0
 
     source_id = _insert_source(
-        conn=conn,
+        db=db,
         source=source,
         source_type=_infer_source_type(source),
         platform=platform,
@@ -397,7 +306,7 @@ def process_source(
         version=version,
     )
     chunks = semantic_chunk(clean, source_value=source)
-    return _insert_chunks(conn, source_id=source_id, docs=chunks)
+    return _insert_chunks(db, source_id=source_id, docs=chunks)
 
 
 def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestSummary:
@@ -406,12 +315,12 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
         summary.skipped_invalid += 1
         return summary
 
-    with _connect() as conn:
-        _bootstrap_db(conn)
-        if _url_exists(conn, url):
+    with SessionLocal() as db:
+        _bootstrap_db(db)
+        if _url_exists(db, url):
             summary.skipped_duplicates += 1
             _log_usage(
-                conn=conn,
+                db=db,
                 source=url,
                 source_type="url",
                 platform=platform,
@@ -430,7 +339,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
         if not markdown.strip():
             summary.failed_sources += 1
             _log_usage(
-                conn=conn,
+                db=db,
                 source=url,
                 source_type="url",
                 platform=platform,
@@ -446,7 +355,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
             return summary
 
         inserted, tokens_used, cost_usd = process_source(
-            conn=conn,
+            db=db,
             source=url,
             text=markdown,
             platform=platform,
@@ -458,7 +367,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
         _log_usage(
-            conn=conn,
+            db=db,
             source=url,
             source_type="url",
             platform=platform,
@@ -476,14 +385,14 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
 
 def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> IngestSummary:
     summary = IngestSummary(input_count=len(urls))
-    with _connect() as conn:
-        _bootstrap_db(conn)
+    with SessionLocal() as db:
+        _bootstrap_db(db)
         for raw_url in urls:
             url = (raw_url or "").strip()
             if not _is_valid_url(url):
                 summary.skipped_invalid += 1
                 _log_usage(
-                    conn=conn,
+                    db=db,
                     source=url or "(invalid-url)",
                     source_type="url",
                     platform=platform,
@@ -497,10 +406,10 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                     cost_usd=0.0,
                 )
                 continue
-            if _url_exists(conn, url):
+            if _url_exists(db, url):
                 summary.skipped_duplicates += 1
                 _log_usage(
-                    conn=conn,
+                    db=db,
                     source=url,
                     source_type="url",
                     platform=platform,
@@ -519,7 +428,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
             if not markdown.strip():
                 summary.failed_sources += 1
                 _log_usage(
-                    conn=conn,
+                    db=db,
                     source=url,
                     source_type="url",
                     platform=platform,
@@ -535,7 +444,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 continue
 
             inserted, tokens_used, cost_usd = process_source(
-                conn=conn,
+                db=db,
                 source=url,
                 text=markdown,
                 platform=platform,
@@ -547,7 +456,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
             summary.tokens_used += tokens_used
             summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
             _log_usage(
-                conn=conn,
+                db=db,
                 source=url,
                 source_type="url",
                 platform=platform,
@@ -583,13 +492,13 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
 
     source_value = os_module.path.abspath(file_path)
 
-    with _connect() as conn:
-        _bootstrap_db(conn)
+    with SessionLocal() as db:
+        _bootstrap_db(db)
         markdown = _extract_pdf_markdown_docling(file_path)
         if not markdown.strip():
             summary.failed_sources += 1
             _log_usage(
-                conn=conn,
+                db=db,
                 source=source_value,
                 source_type="pdf",
                 platform=platform,
@@ -605,7 +514,7 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
             return summary
 
         inserted, tokens_used, cost_usd = process_source(
-            conn=conn,
+            db=db,
             source=source_value,
             text=markdown,
             platform=platform,
@@ -617,7 +526,7 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
         _log_usage(
-            conn=conn,
+            db=db,
             source=source_value,
             source_type="pdf",
             platform=platform,

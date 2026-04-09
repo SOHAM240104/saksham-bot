@@ -15,3 +15,5 @@ def get_env(name: str) -> str:
 DATABASE_URL = get_env("DATABASE_URL")
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+ADMIN_TOKEN = get_env("ADMIN_TOKEN")

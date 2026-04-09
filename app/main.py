@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from config import database
-from models import flow  # noqa: F401
-from routers.flow import router as flow_router
+from models import context, ingestion_records  # noqa: F401
+from routers.admin import router as flow_router
 from routers.health import router as health_router
 
 app = FastAPI(title="Ingestion API", version="1.0.0")

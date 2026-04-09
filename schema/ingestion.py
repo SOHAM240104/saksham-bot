@@ -2,6 +2,7 @@ from typing import List
 
 from pydantic import BaseModel, Field
 
+from schema.common import EnvelopeResponse
 
 class SourceInput(BaseModel):
     platform: str = Field(..., min_length=1)
@@ -24,3 +25,7 @@ class IngestResponse(BaseModel):
     chunks: int
     tokens_used: int
     cost_usd: float
+
+
+class IngestEnvelope(EnvelopeResponse[IngestResponse]):
+    pass
