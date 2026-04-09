@@ -22,6 +22,8 @@ class BulkURLInput(SourceInput):
 class IngestResponse(BaseModel):
     uuid: UUID
     status: str
+    created: str | None = None
+    modified: str | None = None
     processed: int
     skipped: int
     failed: int

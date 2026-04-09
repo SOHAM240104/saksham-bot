@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple
 from urllib.parse import urlparse
+from uuid import UUID
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -74,6 +75,8 @@ class IngestSummary:
     chunks_inserted: int = 0
     tokens_used: int = 0
     cost_usd: float = 0.0
+    uuid: UUID | None = None
+    status: str = "completed"
 
 
 def _require_env(name: str) -> str:
@@ -266,23 +269,33 @@ def _log_usage(
     chunks: int,
     tokens_used: int,
     cost_usd: float,
-) -> None:
+) -> tuple[UUID, str]:
+    status = "completed"
+    if failed > 0 and processed == 0:
+        status = "failed"
+    elif skipped > 0 and processed == 0:
+        status = "not_started"
+
+    usage = IngestionUsageModel(
+        source=source,
+        source_type=source_type,
+        platform=platform,
+        os=os_name,
+        version=version,
+        processed=processed,
+        skipped=skipped,
+        failed=failed,
+        chunks=chunks,
+        tokens_used=tokens_used,
+        cost_usd=cost_usd,
+        status=status,
+    )
     db.add(
-        IngestionUsageModel(
-            source=source,
-            source_type=source_type,
-            platform=platform,
-            os=os_name,
-            version=version,
-            processed=processed,
-            skipped=skipped,
-            failed=failed,
-            chunks=chunks,
-            tokens_used=tokens_used,
-            cost_usd=cost_usd,
-        )
+        usage
     )
     db.commit()
+    db.refresh(usage)
+    return usage.uuid, usage.status
 
 
 def process_source(
@@ -313,13 +326,31 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
     summary = IngestSummary(input_count=1)
     if not _is_valid_url(url):
         summary.skipped_invalid += 1
+        with SessionLocal() as db:
+            _bootstrap_db(db)
+            usage_uuid, usage_status = _log_usage(
+                db=db,
+                source=url or "(invalid-url)",
+                source_type="url",
+                platform=platform,
+                os_name=os,
+                version=version,
+                processed=0,
+                skipped=1,
+                failed=0,
+                chunks=0,
+                tokens_used=0,
+                cost_usd=0.0,
+            )
+            summary.uuid = usage_uuid
+            summary.status = usage_status
         return summary
 
     with SessionLocal() as db:
         _bootstrap_db(db)
         if _url_exists(db, url):
             summary.skipped_duplicates += 1
-            _log_usage(
+            usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
                 source_type="url",
@@ -333,12 +364,14 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
                 tokens_used=0,
                 cost_usd=0.0,
             )
+            summary.uuid = usage_uuid
+            summary.status = usage_status
             return summary
 
         markdown = fetch_markdown(url)
         if not markdown.strip():
             summary.failed_sources += 1
-            _log_usage(
+            usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
                 source_type="url",
@@ -352,6 +385,8 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
                 tokens_used=0,
                 cost_usd=0.0,
             )
+            summary.uuid = usage_uuid
+            summary.status = usage_status
             return summary
 
         inserted, tokens_used, cost_usd = process_source(
@@ -366,7 +401,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
         summary.chunks_inserted += inserted
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
-        _log_usage(
+        usage_uuid, usage_status = _log_usage(
             db=db,
             source=url,
             source_type="url",
@@ -380,6 +415,8 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
             tokens_used=tokens_used,
             cost_usd=cost_usd,
         )
+        summary.uuid = usage_uuid
+        summary.status = usage_status
     return summary
 
 
@@ -391,7 +428,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
             url = (raw_url or "").strip()
             if not _is_valid_url(url):
                 summary.skipped_invalid += 1
-                _log_usage(
+                usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url or "(invalid-url)",
                     source_type="url",
@@ -405,10 +442,12 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                     tokens_used=0,
                     cost_usd=0.0,
                 )
+                summary.uuid = usage_uuid
+                summary.status = usage_status
                 continue
             if _url_exists(db, url):
                 summary.skipped_duplicates += 1
-                _log_usage(
+                usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url,
                     source_type="url",
@@ -422,12 +461,14 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                     tokens_used=0,
                     cost_usd=0.0,
                 )
+                summary.uuid = usage_uuid
+                summary.status = usage_status
                 continue
 
             markdown = fetch_markdown(url)
             if not markdown.strip():
                 summary.failed_sources += 1
-                _log_usage(
+                usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url,
                     source_type="url",
@@ -441,6 +482,8 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                     tokens_used=0,
                     cost_usd=0.0,
                 )
+                summary.uuid = usage_uuid
+                summary.status = usage_status
                 continue
 
             inserted, tokens_used, cost_usd = process_source(
@@ -455,7 +498,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
             summary.chunks_inserted += inserted
             summary.tokens_used += tokens_used
             summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
-            _log_usage(
+            usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
                 source_type="url",
@@ -469,6 +512,8 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 tokens_used=tokens_used,
                 cost_usd=cost_usd,
             )
+            summary.uuid = usage_uuid
+            summary.status = usage_status
     return summary
 
 
@@ -497,7 +542,7 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
         markdown = _extract_pdf_markdown_docling(file_path)
         if not markdown.strip():
             summary.failed_sources += 1
-            _log_usage(
+            usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=source_value,
                 source_type="pdf",
@@ -511,6 +556,8 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
                 tokens_used=0,
                 cost_usd=0.0,
             )
+            summary.uuid = usage_uuid
+            summary.status = usage_status
             return summary
 
         inserted, tokens_used, cost_usd = process_source(
@@ -525,7 +572,7 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
         summary.chunks_inserted += inserted
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
-        _log_usage(
+        usage_uuid, usage_status = _log_usage(
             db=db,
             source=source_value,
             source_type="pdf",
@@ -539,6 +586,8 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
             tokens_used=tokens_used,
             cost_usd=cost_usd,
         )
+        summary.uuid = usage_uuid
+        summary.status = usage_status
     return summary
 
 

@@ -14,6 +14,10 @@ class NameOutput(BaseModel):
     uuid: UUID
     status: str
     name: str
+    created: str | None = None
+    modified: str | None = None
+    is_archived: bool = False
+    is_deleted: bool = False
 
 
 class NameEnvelope(EnvelopeResponse[NameOutput]):
