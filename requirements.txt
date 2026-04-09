@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-multipart
+psycopg[binary]
+sqlalchemy
+pandas
+openpyxl
+python-dotenv
+langchain-core
+langchain-openai
+langchain-text-splitters
+pgvector
+crawl4ai
+docling
+openai
