@@ -1,4 +1,5 @@
 from typing import List
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,8 @@ class BulkURLInput(SourceInput):
 
 
 class IngestResponse(BaseModel):
+    uuid: UUID
+    status: str
     processed: int
     skipped: int
     failed: int

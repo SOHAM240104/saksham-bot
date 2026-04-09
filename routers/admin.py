@@ -1,7 +1,6 @@
 import os
 import tempfile
 from collections.abc import Callable
-from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Security, UploadFile
@@ -26,6 +25,8 @@ router = APIRouter(dependencies=[Security(require_admin_token)])
 
 def _to_response(summary: IngestSummary) -> IngestResponse:
     return IngestResponse(
+        uuid=uuid4(),
+        status="completed",
         processed=summary.processed_sources,
         skipped=summary.skipped_duplicates + summary.skipped_invalid,
         failed=summary.failed_sources,
@@ -35,21 +36,25 @@ def _to_response(summary: IngestSummary) -> IngestResponse:
     )
 
 
-def _wrap_response(data: list[Any], status_code: int, message: str) -> dict[str, Any]:
-    return {
-        "request_id": uuid4(),
-        "status_code": status_code,
-        "message": message,
-        "data": data,
-    }
+def _wrap_ingest(summary: IngestSummary, status_code: int = 200) -> IngestEnvelope:
+    return IngestEnvelope(
+        status_code=status_code,
+        data=[_to_response(summary)],
+    )
 
 
-def _wrap_ingest(summary: IngestSummary, status_code: int = 200, message: str = "success") -> IngestEnvelope:
-    return IngestEnvelope(**_wrap_response([_to_response(summary)], status_code, message))
-
-
-def _wrap_name(name: str, status_code: int = 201, message: str = "created") -> NameEnvelope:
-    return NameEnvelope(**_wrap_response([NameOutput(name=name)], status_code, message))
+def _wrap_name(item_id: int, name: str, status_code: int = 201) -> NameEnvelope:
+    return NameEnvelope(
+        status_code=status_code,
+        data=[
+            NameOutput(
+                id=item_id,
+                uuid=uuid4(),
+                status="completed",
+                name=name,
+            )
+        ],
+    )
 
 
 def _get_platform_or_404(db: Session, platform: str) -> PlatformModel:
@@ -66,7 +71,7 @@ def _get_os_or_404(db: Session, platform_id: int, os_name: str) -> OSModel:
     return os_row
 
 
-def _ensure_context_exists(db: Session, platform: str, os_name: str, version: str) -> None:
+def _resolve_context_or_404(db: Session, platform: str, os_name: str, version: str) -> tuple[PlatformModel, OSModel, VersionModel]:
     platform_row = _get_platform_or_404(db, platform)
     os_row = _get_os_or_404(db, platform_row.id, os_name)
     version_row = (
@@ -76,6 +81,7 @@ def _ensure_context_exists(db: Session, platform: str, os_name: str, version: st
     )
     if version_row is None:
         raise HTTPException(status_code=404, detail="Version not found under platform and OS")
+    return platform_row, os_row, version_row
 
 
 def _run_file_ingestion(
@@ -85,7 +91,6 @@ def _run_file_ingestion(
     platform: str,
     os_name: str,
     version: str,
-    message: str,
 ) -> IngestEnvelope:
     suffix = os.path.splitext(file.filename or "")[1] or default_suffix
     temp_path = ""
@@ -94,7 +99,7 @@ def _run_file_ingestion(
             temp_path = tmp.name
             tmp.write(file.file.read())
         summary = ingest_fn(temp_path, platform=platform, os=os_name, version=version)
-        return _wrap_ingest(summary, status_code=200, message=message)
+        return _wrap_ingest(summary, status_code=200)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -108,7 +113,7 @@ def create_platform(payload: NameInput, db: Session = Depends(get_db)) -> NameEn
         row = PlatformModel(name=payload.name)
         db.add(row)
         db.commit()
-        return _wrap_name(row.name)
+        return _wrap_name(row.id, row.name)
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="Platform already exists") from exc
@@ -121,7 +126,7 @@ def create_os(platform: str, payload: NameInput, db: Session = Depends(get_db)) 
         row = OSModel(platform_id=platform_row.id, name=payload.name)
         db.add(row)
         db.commit()
-        return _wrap_name(row.name)
+        return _wrap_name(row.id, row.name)
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="OS already exists under platform") from exc
@@ -135,7 +140,7 @@ def create_version(platform: str, os: str, payload: NameInput, db: Session = Dep
         row = VersionModel(os_id=os_row.id, name=payload.name)
         db.add(row)
         db.commit()
-        return _wrap_name(row.name)
+        return _wrap_name(row.id, row.name)
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="Version already exists under platform and OS") from exc
@@ -143,26 +148,26 @@ def create_version(platform: str, os: str, payload: NameInput, db: Session = Dep
 
 @router.post("/platforms/{platform}/oses/{os}/versions/{version}/train/url", response_model=IngestEnvelope, status_code=200)
 def train_single_url(platform: str, os: str, version: str, payload: TrainURLInput, db: Session = Depends(get_db)) -> IngestEnvelope:
-    _ensure_context_exists(db, platform, os, version)
+    _resolve_context_or_404(db, platform, os, version)
     summary = ingest_single_url(
         url=payload.url,
         platform=platform,
         os=os,
         version=version,
     )
-    return _wrap_ingest(summary, status_code=200, message="ingestion completed")
+    return _wrap_ingest(summary)
 
 
 @router.post("/platforms/{platform}/oses/{os}/versions/{version}/train/urls", response_model=IngestEnvelope, status_code=200)
 def train_bulk_urls(platform: str, os: str, version: str, payload: TrainBulkURLsInput, db: Session = Depends(get_db)) -> IngestEnvelope:
-    _ensure_context_exists(db, platform, os, version)
+    _resolve_context_or_404(db, platform, os, version)
     summary = ingest_bulk_urls(
         urls=payload.urls,
         platform=platform,
         os=os,
         version=version,
     )
-    return _wrap_ingest(summary, status_code=200, message="bulk ingestion completed")
+    return _wrap_ingest(summary)
 
 
 @router.post("/platforms/{platform}/oses/{os}/versions/{version}/train/excel", response_model=IngestEnvelope, status_code=200)
@@ -173,7 +178,7 @@ def train_excel(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    _ensure_context_exists(db, platform, os, version)
+    _resolve_context_or_404(db, platform, os, version)
     return _run_file_ingestion(
         file=file,
         default_suffix=".xlsx",
@@ -181,7 +186,6 @@ def train_excel(
         platform=platform,
         os_name=os,
         version=version,
-        message="excel ingestion completed",
     )
 
 
@@ -193,7 +197,7 @@ def train_pdf(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    _ensure_context_exists(db, platform, os, version)
+    _resolve_context_or_404(db, platform, os, version)
     return _run_file_ingestion(
         file=file,
         default_suffix=".pdf",
@@ -201,5 +205,4 @@ def train_pdf(
         platform=platform,
         os_name=os,
         version=version,
-        message="pdf ingestion completed",
     )

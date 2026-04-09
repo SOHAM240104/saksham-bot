@@ -231,7 +231,7 @@ def _insert_chunks(db: Session, source_id: int, docs: Iterable[Document]) -> Tup
                 source_id=source_id,
                 text=doc.page_content,
                 embedding=vector,
-                metadata=metadata,
+                chunk_metadata=metadata,
             )
         )
     db.commit()
@@ -279,7 +279,7 @@ def _log_usage(
             failed=failed,
             chunks=chunks,
             tokens_used=tokens_used,
-            estimated_cost=cost_usd,
+            cost_usd=cost_usd,
         )
     )
     db.commit()

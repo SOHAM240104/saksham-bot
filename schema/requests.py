@@ -1,4 +1,5 @@
 from typing import List
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +10,9 @@ class NameInput(BaseModel):
 
 
 class NameOutput(BaseModel):
+    id: int
+    uuid: UUID
+    status: str
     name: str
 
 

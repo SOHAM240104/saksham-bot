@@ -23,7 +23,7 @@ class ChunkModel(Base):
     source_id = Column(BigInteger, ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False, index=True)
     text = Column(Text, nullable=False)
     embedding = Column(JSONB, nullable=False)
-    metadata = Column(JSONB, nullable=False)
+    chunk_metadata = Column("metadata", JSONB, nullable=False)
 
 
 class IngestionUsageModel(Base):
@@ -40,5 +40,5 @@ class IngestionUsageModel(Base):
     failed = Column(Integer, nullable=False, default=0)
     chunks = Column(Integer, nullable=False, default=0)
     tokens_used = Column(Integer, nullable=False, default=0)
-    estimated_cost = Column(Float, nullable=False, default=0.0)
+    cost_usd = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
