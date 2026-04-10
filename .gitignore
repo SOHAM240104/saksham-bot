@@ -17,3 +17,6 @@ env/
 .env
 .env.*
 !.env.example
+
+# SQL migrations run locally / in deployment pipelines; not tracked in this repo.
+migrations/
