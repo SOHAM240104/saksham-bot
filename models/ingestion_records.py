@@ -1,7 +1,6 @@
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 
 from config.database import Base
@@ -26,15 +25,6 @@ class SourceModel(IngestionBaseModel):
     platform = Column(String, nullable=False)
     os = Column(String, nullable=False)
     version = Column(String, nullable=False)
-
-
-class ChunkModel(IngestionBaseModel):
-    __tablename__ = "chunks"
-
-    source_id = Column(BigInteger, ForeignKey("sources.id", ondelete="RESTRICT"), nullable=False, index=True)
-    text = Column(Text, nullable=False)
-    embedding = Column(JSONB, nullable=False)
-    chunk_metadata = Column("metadata", JSONB, nullable=False)
 
 
 class IngestionUsageModel(IngestionBaseModel):

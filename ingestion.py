@@ -1,19 +1,4 @@
-"""
-Standalone ingestion layer for URLs, Excel URL lists, and PDFs.
-
-Features:
-- Generic metadata fields: platform, os, version (no hardcoded values)
-- Input entry points:
-    ingest_single_url(...)
-    ingest_bulk_urls(...)
-    ingest_excel(...)
-    ingest_pdf(...)
-- Shared pipeline:
-    fetch/extract -> clean -> semantic chunk -> append with SQLAlchemy
-- Basic URL dedup: skip if URL already exists in sources table
-- Append-only writes for chunks
-
-"""
+"""Ingest URLs, Excel URL lists, and PDFs into PGVector (chunked text + embeddings)."""
 
 from __future__ import annotations
 
@@ -21,27 +6,28 @@ import asyncio
 import os as os_module
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 from urllib.parse import urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pandas as pd
-from dotenv import load_dotenv
+import tiktoken
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-from openai import OpenAI
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.vectorstore import get_vector_store
 from config.database import Base, SessionLocal
-from models.ingestion_records import ChunkModel, IngestionUsageModel, SourceModel
+from models.ingestion_records import IngestionUsageModel, SourceModel
+from settings import DEFAULT_VECTOR_COLLECTION, SCAM_VECTOR_COLLECTION, normalize_vector_collection
 
-load_dotenv()
-
-EMBEDDING_MODEL = "text-embedding-3-small"
-# OpenAI price for text-embedding-3-small is $0.00002 per 1K tokens.
+# OpenAI price for text-embedding-3-small is $0.00002 per 1K tokens (used for estimates only).
 EMBEDDING_COST_PER_1K_TOKENS_USD = 0.00002
+# tiktoken cl100k_base aligns with OpenAI embedding tokenization for cost estimates.
+_TIKTOKEN_ENCODING = "cl100k_base"
 
 _crawl4ai_md_generator = DefaultMarkdownGenerator(
     options={
@@ -63,6 +49,7 @@ FALLBACK_SPLITTER = RecursiveCharacterTextSplitter(
     length_function=len,
 )
 MAX_HEADER_CHUNK_SIZE = 1500
+ALLOWED_SOURCE_TYPES = {"url", "pdf"}
 
 
 @dataclass
@@ -77,13 +64,6 @@ class IngestSummary:
     cost_usd: float = 0.0
     uuid: UUID | None = None
     status: str = "completed"
-
-
-def _require_env(name: str) -> str:
-    value = os_module.getenv(name, "").strip()
-    if not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value
 
 
 def _clean_text(text: str) -> str:
@@ -190,8 +170,8 @@ def _bootstrap_db(db: Session) -> None:
     Base.metadata.create_all(bind=db.get_bind())
 
 
-def _url_exists(db: Session, url: str) -> bool:
-    return db.query(SourceModel.id).filter(SourceModel.type == "url", SourceModel.source == url).first() is not None
+def _url_exists(db: Session, url: str, source_type: str) -> bool:
+    return db.query(SourceModel.id).filter(SourceModel.type == source_type, SourceModel.source == url).first() is not None
 
 
 def _insert_source(
@@ -202,8 +182,20 @@ def _insert_source(
     os_name: str,
     version: str,
 ) -> int:
-    existing = db.query(SourceModel).filter(SourceModel.source == source).first()
+    existing = db.query(SourceModel).filter(SourceModel.source == source, SourceModel.type == source_type).first()
     if existing is not None:
+        changed = False
+        if existing.platform != platform:
+            existing.platform = platform
+            changed = True
+        if existing.os != os_name:
+            existing.os = os_name
+            changed = True
+        if existing.version != version:
+            existing.version = version
+            changed = True
+        if changed:
+            db.flush()
         return int(existing.id)
 
     row = SourceModel(
@@ -218,42 +210,131 @@ def _insert_source(
     return int(row.id)
 
 
-def _insert_chunks(db: Session, source_id: int, docs: Iterable[Document]) -> Tuple[int, int, float]:
+def _estimate_embedding_tokens_and_cost(texts: List[str]) -> Tuple[int, float]:
+    """Estimate token count and USD cost for embedding inputs (no API usage object from LangChain)."""
+    if not texts:
+        return 0, 0.0
+    enc = tiktoken.get_encoding(_TIKTOKEN_ENCODING)
+    tokens_used = sum(len(enc.encode(t)) for t in texts)
+    cost_usd = round((tokens_used / 1000.0) * EMBEDDING_COST_PER_1K_TOKENS_USD, 8)
+    return tokens_used, cost_usd
+
+
+def _insert_chunks(
+    db: Session,
+    source_id: int,
+    source_value: str,
+    source_type: str,
+    platform: str,
+    os_name: str,
+    version: str,
+    docs: Iterable[Document],
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+) -> Tuple[int, int, float]:
     docs_list = list(docs)
     if not docs_list:
         return 0, 0, 0.0
-    texts = [doc.page_content for doc in docs_list]
-    vectors, tokens_used, cost_usd = _embed_texts_with_usage(texts)
-    for doc, vector in zip(docs_list, vectors):
-        metadata = {
-            "title": (doc.metadata or {}).get("title", "untitled"),
-            "header": (doc.metadata or {}).get("header", ""),
-        }
-        db.add(
-            ChunkModel(
-                source_id=source_id,
-                text=doc.page_content,
-                embedding=vector,
-                chunk_metadata=metadata,
-            )
+
+    collection_key = normalize_vector_collection(vector_collection)
+    ids = [str(uuid4()) for _ in docs_list]
+    to_store: List[Document] = []
+    for doc in docs_list:
+        meta = dict(doc.metadata or {})
+        meta.update(
+            {
+                "source_id": source_id,
+                "source": source_value,
+                "source_type": source_type,
+                "platform": platform,
+                "os": os_name,
+                "version": version,
+                "title": meta.get("title", "untitled"),
+                "header": meta.get("header", ""),
+            }
         )
+        to_store.append(Document(page_content=doc.page_content, metadata=meta))
+
+    texts = [d.page_content for d in to_store]
+    tokens_used, cost_usd = _estimate_embedding_tokens_and_cost(texts)
+
+    vector_store = get_vector_store(collection_key)
+    vector_store.add_documents(documents=to_store, ids=ids)
+
     db.commit()
     return len(docs_list), tokens_used, cost_usd
 
 
-def _embed_texts_with_usage(texts: List[str]) -> Tuple[List[List[float]], int, float]:
-    if not texts:
-        return [], 0, 0.0
-    client = OpenAI(api_key=_require_env("OPENAI_API_KEY"))
-    result = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    vectors = [item.embedding for item in result.data]
-    tokens_used = int(getattr(result.usage, "total_tokens", 0) or 0)
-    cost_usd = round((tokens_used / 1000.0) * EMBEDDING_COST_PER_1K_TOKENS_USD, 8)
-    return vectors, tokens_used, cost_usd
+def _normalize_scam_source_key(url: str) -> str:
+    return (url or "").strip()
+
+
+def _scam_url_already_ingested(db: Session, url: str) -> bool:
+    """True if the scam collection already has at least one chunk for this source key (metadata.url)."""
+    key = _normalize_scam_source_key(url)
+    if not key:
+        return False
+    cname = normalize_vector_collection(SCAM_VECTOR_COLLECTION)
+    row = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM langchain_pg_embedding e
+            INNER JOIN langchain_pg_collection c ON e.collection_id = c.uuid
+            WHERE c.name = :cname
+              AND e.cmetadata->>'url' = :url
+            LIMIT 1
+            """
+        ),
+        {"cname": cname, "url": key},
+    ).fetchone()
+    return row is not None
+
+
+def _insert_scam_chunks(
+    url: str,
+    docs: Iterable[Document],
+) -> Tuple[int, int, float]:
+    """Store chunks in the scam collection with metadata ``{url}`` only (ids are UUID strings)."""
+    docs_list = list(docs)
+    if not docs_list:
+        return 0, 0, 0.0
+
+    norm_url = _normalize_scam_source_key(url)
+    collection_key = normalize_vector_collection(SCAM_VECTOR_COLLECTION)
+    ids = [str(uuid4()) for _ in docs_list]
+    to_store = [
+        Document(page_content=doc.page_content, metadata={"url": norm_url}) for doc in docs_list
+    ]
+
+    texts = [d.page_content for d in to_store]
+    tokens_used, cost_usd = _estimate_embedding_tokens_and_cost(texts)
+
+    vector_store = get_vector_store(collection_key)
+    vector_store.add_documents(documents=to_store, ids=ids)
+    return len(docs_list), tokens_used, cost_usd
+
+
+def process_scam_source(db: Session, url: str, text: str) -> Tuple[int, int, float]:
+    """Chunk and embed into the scam collection only (no sources / usage rows; metadata is url-only)."""
+    clean = _clean_text(text)
+    if not clean:
+        return 0, 0, 0.0
+
+    chunk_docs = semantic_chunk(clean, source_value=url)
+    return _insert_scam_chunks(url, chunk_docs)
 
 
 def _infer_source_type(source: str) -> str:
     return "url" if _is_valid_url(source) else "pdf"
+
+
+def _resolve_source_type(source: str, source_type: str | None) -> str:
+    if source_type is None:
+        return _infer_source_type(source)
+    normalized = source_type.strip().lower()
+    if normalized not in ALLOWED_SOURCE_TYPES:
+        raise ValueError(f"Invalid source_type: {source_type}. Allowed: {sorted(ALLOWED_SOURCE_TYPES)}")
+    return normalized
 
 
 def _log_usage(
@@ -290,9 +371,7 @@ def _log_usage(
         cost_usd=cost_usd,
         status=status,
     )
-    db.add(
-        usage
-    )
+    db.add(usage)
     db.commit()
     db.refresh(usage)
     return usage.uuid, usage.status
@@ -305,25 +384,52 @@ def process_source(
     platform: str,
     os_name: str,
     version: str,
+    source_type: str | None = None,
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+    *,
+    source_storage_key: str | None = None,
 ) -> Tuple[int, int, float]:
     clean = _clean_text(text)
     if not clean:
         return 0, 0, 0.0
 
+    resolved_source_type = _resolve_source_type(source, source_type)
+    row_source = source_storage_key if source_storage_key is not None else source
     source_id = _insert_source(
         db=db,
-        source=source,
-        source_type=_infer_source_type(source),
+        source=row_source,
+        source_type=resolved_source_type,
         platform=platform,
         os_name=os_name,
         version=version,
     )
-    chunks = semantic_chunk(clean, source_value=source)
-    return _insert_chunks(db, source_id=source_id, docs=chunks)
+    chunk_docs = semantic_chunk(clean, source_value=source)
+    return _insert_chunks(
+        db,
+        source_id=source_id,
+        source_value=source,
+        source_type=resolved_source_type,
+        platform=platform,
+        os_name=os_name,
+        version=version,
+        docs=chunk_docs,
+        vector_collection=vector_collection,
+    )
 
 
-def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestSummary:
+def ingest_single_url(
+    url: str,
+    platform: str,
+    os: str,
+    version: str,
+    source_type: str | None = None,
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+    *,
+    source_storage_key: str | None = None,
+) -> IngestSummary:
     summary = IngestSummary(input_count=1)
+    resolved_source_type = _resolve_source_type(url, source_type)
+    dedup_key = source_storage_key if source_storage_key is not None else url
     if not _is_valid_url(url):
         summary.skipped_invalid += 1
         with SessionLocal() as db:
@@ -331,7 +437,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
             usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url or "(invalid-url)",
-                source_type="url",
+                source_type=resolved_source_type,
                 platform=platform,
                 os_name=os,
                 version=version,
@@ -348,12 +454,12 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
 
     with SessionLocal() as db:
         _bootstrap_db(db)
-        if _url_exists(db, url):
+        if _url_exists(db, dedup_key, resolved_source_type):
             summary.skipped_duplicates += 1
             usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
-                source_type="url",
+                source_type=resolved_source_type,
                 platform=platform,
                 os_name=os,
                 version=version,
@@ -374,7 +480,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
             usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
-                source_type="url",
+                source_type=resolved_source_type,
                 platform=platform,
                 os_name=os,
                 version=version,
@@ -396,6 +502,9 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
             platform=platform,
             os_name=os,
             version=version,
+            source_type=resolved_source_type,
+            vector_collection=vector_collection,
+            source_storage_key=source_storage_key,
         )
         summary.processed_sources += 1
         summary.chunks_inserted += inserted
@@ -404,7 +513,7 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
         usage_uuid, usage_status = _log_usage(
             db=db,
             source=url,
-            source_type="url",
+            source_type=resolved_source_type,
             platform=platform,
             os_name=os,
             version=version,
@@ -420,8 +529,22 @@ def ingest_single_url(url: str, platform: str, os: str, version: str) -> IngestS
     return summary
 
 
-def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> IngestSummary:
+def ingest_bulk_urls(
+    urls: List[str],
+    platform: str,
+    os: str,
+    version: str,
+    source_type: str | None = None,
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+    *,
+    source_storage_key_fn: Callable[[str], str] | None = None,
+) -> IngestSummary:
     summary = IngestSummary(input_count=len(urls))
+    resolved_default_source_type = _resolve_source_type("https://example.com", source_type)
+
+    def _row_key(u: str) -> str:
+        return source_storage_key_fn(u) if source_storage_key_fn is not None else u
+
     with SessionLocal() as db:
         _bootstrap_db(db)
         for raw_url in urls:
@@ -431,7 +554,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url or "(invalid-url)",
-                    source_type="url",
+                    source_type=resolved_default_source_type,
                     platform=platform,
                     os_name=os,
                     version=version,
@@ -445,12 +568,13 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 summary.uuid = usage_uuid
                 summary.status = usage_status
                 continue
-            if _url_exists(db, url):
+            row_key = _row_key(url)
+            if _url_exists(db, row_key, resolved_default_source_type):
                 summary.skipped_duplicates += 1
                 usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url,
-                    source_type="url",
+                    source_type=resolved_default_source_type,
                     platform=platform,
                     os_name=os,
                     version=version,
@@ -471,7 +595,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 usage_uuid, usage_status = _log_usage(
                     db=db,
                     source=url,
-                    source_type="url",
+                    source_type=resolved_default_source_type,
                     platform=platform,
                     os_name=os,
                     version=version,
@@ -486,6 +610,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 summary.status = usage_status
                 continue
 
+            sk = source_storage_key_fn(url) if source_storage_key_fn is not None else None
             inserted, tokens_used, cost_usd = process_source(
                 db=db,
                 source=url,
@@ -493,6 +618,9 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
                 platform=platform,
                 os_name=os,
                 version=version,
+                source_type=resolved_default_source_type,
+                vector_collection=vector_collection,
+                source_storage_key=sk,
             )
             summary.processed_sources += 1
             summary.chunks_inserted += inserted
@@ -501,7 +629,7 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
             usage_uuid, usage_status = _log_usage(
                 db=db,
                 source=url,
-                source_type="url",
+                source_type=resolved_default_source_type,
                 platform=platform,
                 os_name=os,
                 version=version,
@@ -517,7 +645,15 @@ def ingest_bulk_urls(urls: List[str], platform: str, os: str, version: str) -> I
     return summary
 
 
-def ingest_excel(file_path: str, platform: str, os: str, version: str) -> IngestSummary:
+def ingest_excel(
+    file_path: str,
+    platform: str,
+    os: str,
+    version: str,
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+    *,
+    source_storage_key_fn: Callable[[str], str] | None = None,
+) -> IngestSummary:
     df = pd.read_excel(file_path)
     normalized = {str(c).strip().lower(): c for c in df.columns}
     # Accept common variants to reduce upload friction.
@@ -526,10 +662,25 @@ def ingest_excel(file_path: str, platform: str, os: str, version: str) -> Ingest
         raise ValueError("Excel must contain a URL column: url / urls")
 
     urls = [str(v).strip() for v in df[url_col].dropna().tolist() if str(v).strip()]
-    return ingest_bulk_urls(urls, platform=platform, os=os, version=version)
+    return ingest_bulk_urls(
+        urls,
+        platform=platform,
+        os=os,
+        version=version,
+        vector_collection=vector_collection,
+        source_storage_key_fn=source_storage_key_fn,
+    )
 
 
-def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSummary:
+def ingest_pdf(
+    file_path: str,
+    platform: str,
+    os: str,
+    version: str,
+    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
+    *,
+    source_storage_key: str | None = None,
+) -> IngestSummary:
     summary = IngestSummary(input_count=1)
     if not os_module.path.exists(file_path):
         summary.failed_sources += 1
@@ -567,6 +718,8 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
             platform=platform,
             os_name=os,
             version=version,
+            vector_collection=vector_collection,
+            source_storage_key=source_storage_key,
         )
         summary.processed_sources += 1
         summary.chunks_inserted += inserted
@@ -591,14 +744,116 @@ def ingest_pdf(file_path: str, platform: str, os: str, version: str) -> IngestSu
     return summary
 
 
+def ingest_scam_single_url(url: str, source_type: str | None = None) -> IngestSummary:
+    """Ingest one URL into the scam collection only: ``metadata.url``, chunk ids, embeddings (no sources/usage)."""
+    summary = IngestSummary(input_count=1)
+    _resolve_source_type(url, source_type)
+
+    if not _is_valid_url(url):
+        summary.skipped_invalid += 1
+        summary.status = "completed"
+        return summary
+
+    with SessionLocal() as db:
+        _bootstrap_db(db)
+        if _scam_url_already_ingested(db, url):
+            summary.skipped_duplicates += 1
+            summary.status = "completed"
+            return summary
+
+        markdown = fetch_markdown(url)
+        if not markdown.strip():
+            summary.failed_sources += 1
+            summary.status = "completed"
+            return summary
+
+        inserted, tokens_used, cost_usd = process_scam_source(db, url, markdown)
+        summary.processed_sources += 1
+        summary.chunks_inserted += inserted
+        summary.tokens_used += tokens_used
+        summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
+        summary.status = "completed"
+    return summary
+
+
+def ingest_scam_bulk_urls(urls: List[str], source_type: str | None = None) -> IngestSummary:
+    _resolve_source_type("https://example.com", source_type)
+    summary = IngestSummary(input_count=len(urls))
+
+    with SessionLocal() as db:
+        _bootstrap_db(db)
+        for raw_url in urls:
+            url = (raw_url or "").strip()
+            if not _is_valid_url(url):
+                summary.skipped_invalid += 1
+                continue
+            if _scam_url_already_ingested(db, url):
+                summary.skipped_duplicates += 1
+                continue
+            markdown = fetch_markdown(url)
+            if not markdown.strip():
+                summary.failed_sources += 1
+                continue
+            inserted, tokens_used, cost_usd = process_scam_source(db, url, markdown)
+            summary.processed_sources += 1
+            summary.chunks_inserted += inserted
+            summary.tokens_used += tokens_used
+            summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
+    summary.status = "completed"
+    return summary
+
+
+def ingest_scam_excel(file_path: str) -> IngestSummary:
+    df = pd.read_excel(file_path)
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    url_col = normalized.get("url") or normalized.get("urls")
+    if not url_col:
+        raise ValueError("Excel must contain a URL column: url / urls")
+
+    urls = [str(v).strip() for v in df[url_col].dropna().tolist() if str(v).strip()]
+    return ingest_scam_bulk_urls(urls)
+
+
+def ingest_scam_pdf(file_path: str) -> IngestSummary:
+    summary = IngestSummary(input_count=1)
+    if not os_module.path.exists(file_path):
+        summary.failed_sources += 1
+        summary.status = "completed"
+        return summary
+
+    source_key = os_module.path.abspath(file_path)
+
+    with SessionLocal() as db:
+        _bootstrap_db(db)
+        if _scam_url_already_ingested(db, source_key):
+            summary.skipped_duplicates += 1
+            summary.status = "completed"
+            return summary
+
+        markdown = _extract_pdf_markdown_docling(file_path)
+        if not markdown.strip():
+            summary.failed_sources += 1
+            summary.status = "completed"
+            return summary
+
+        inserted, tokens_used, cost_usd = process_scam_source(db, source_key, markdown)
+        summary.processed_sources += 1
+        summary.chunks_inserted += inserted
+        summary.tokens_used += tokens_used
+        summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
+        summary.status = "completed"
+    return summary
+
+
 if __name__ == "__main__":
     # Example usage:
     # Ensure .env contains DATABASE_URL and OPENAI_API_KEY.
     one = ingest_single_url(
-        url="https://support.apple.com/en-in/guide/iphone/iph4fd8a0b89/18.0/ios/18.0",
+        url="https://support.apple.com/en-in/guide/iphone/iphd6288a67f/26/ios/26",
         platform="Apple",
         os="iOS",
-        version="18",
+        version="26",
+        vector_collection="tech",
     )
     print("single_url:", one)
 

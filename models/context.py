@@ -11,7 +11,7 @@ class ContextBaseModel(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     uuid = Column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid4)
-    name = Column(String, nullable=False)
+    identity = Column("name", String, nullable=False)
     created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     is_archived = Column(Boolean, nullable=False, default=False)
@@ -20,8 +20,6 @@ class ContextBaseModel(Base):
 
 class PlatformModel(ContextBaseModel):
     __tablename__ = "platforms"
-
-    name = Column(String, nullable=False, unique=True)
 
 
 class OSModel(ContextBaseModel):

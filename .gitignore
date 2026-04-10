@@ -13,3 +13,7 @@ venv/
 env/
 
 .DS_Store
+
+.env
+.env.*
+!.env.example

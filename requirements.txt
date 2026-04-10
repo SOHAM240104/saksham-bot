@@ -8,7 +8,9 @@ openpyxl
 python-dotenv
 langchain-core
 langchain-openai
+langchain-postgres
 langchain-text-splitters
+tiktoken
 crawl4ai
 docling
 openai
