@@ -16,13 +16,12 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.vectorstore import get_vector_store
 from config.database import Base, SessionLocal
-from models.ingestion_records import IngestionUsageModel, SourceModel
-from settings import DEFAULT_VECTOR_COLLECTION, SCAM_VECTOR_COLLECTION, normalize_vector_collection
+from models.ingestion_records import IngestionUsageModel, ScamIngestionModel, SourceModel
+from settings import SCAM_VECTOR_COLLECTION, TECH_VECTOR_COLLECTION
 
 # OpenAI price for text-embedding-3-small is $0.00002 per 1K tokens (used for estimates only).
 EMBEDDING_COST_PER_1K_TOKENS_USD = 0.00002
@@ -229,13 +228,12 @@ def _insert_chunks(
     os_name: str,
     version: str,
     docs: Iterable[Document],
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
 ) -> Tuple[int, int, float]:
     docs_list = list(docs)
     if not docs_list:
         return 0, 0, 0.0
 
-    collection_key = normalize_vector_collection(vector_collection)
+    collection_key = TECH_VECTOR_COLLECTION
     ids = [str(uuid4()) for _ in docs_list]
     to_store: List[Document] = []
     for doc in docs_list:
@@ -268,26 +266,68 @@ def _normalize_scam_source_key(url: str) -> str:
     return (url or "").strip()
 
 
-def _scam_url_already_ingested(db: Session, url: str) -> bool:
-    """True if the scam collection already has at least one chunk for this source key (metadata.url)."""
-    key = _normalize_scam_source_key(url)
+def _scam_row_by_key(db: Session, key: str) -> ScamIngestionModel | None:
     if not key:
-        return False
-    cname = normalize_vector_collection(SCAM_VECTOR_COLLECTION)
-    row = db.execute(
-        text(
-            """
-            SELECT 1
-            FROM langchain_pg_embedding e
-            INNER JOIN langchain_pg_collection c ON e.collection_id = c.uuid
-            WHERE c.name = :cname
-              AND e.cmetadata->>'url' = :url
-            LIMIT 1
-            """
-        ),
-        {"cname": cname, "url": key},
-    ).fetchone()
-    return row is not None
+        return None
+    return db.query(ScamIngestionModel).filter(ScamIngestionModel.source_key == key).first()
+
+
+def _derive_scam_status(processed: int, skipped: int, failed: int, explicit: str | None = None) -> str:
+    if explicit in ("completed", "failed"):
+        return explicit
+    if failed > 0 and processed == 0:
+        return "failed"
+    return "completed"
+
+
+def _persist_scam_ingestion(
+    db: Session,
+    *,
+    source_key: str,
+    source_type: str,
+    processed: int,
+    skipped: int,
+    failed: int,
+    chunks: int,
+    tokens_used: int,
+    cost_usd: float,
+    status: str | None = None,
+) -> UUID:
+    final_status = _derive_scam_status(processed, skipped, failed, explicit=status)
+    existing = _scam_row_by_key(db, source_key)
+    if existing is not None:
+        existing.source_type = source_type
+        existing.processed = processed
+        existing.skipped = skipped
+        existing.failed = failed
+        existing.chunks = chunks
+        existing.tokens_used = tokens_used
+        existing.cost_usd = cost_usd
+        existing.status = final_status
+        db.commit()
+        db.refresh(existing)
+        return existing.uuid
+    row = ScamIngestionModel(
+        source_key=source_key,
+        source_type=source_type,
+        processed=processed,
+        skipped=skipped,
+        failed=failed,
+        chunks=chunks,
+        tokens_used=tokens_used,
+        cost_usd=cost_usd,
+        status=final_status,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row.uuid
+
+
+def _scam_already_embedded_in_table(db: Session, key: str) -> bool:
+    """Dedup source of truth: prior successful ingest recorded with chunks."""
+    row = _scam_row_by_key(db, key)
+    return row is not None and row.chunks > 0
 
 
 def _insert_scam_chunks(
@@ -300,7 +340,7 @@ def _insert_scam_chunks(
         return 0, 0, 0.0
 
     norm_url = _normalize_scam_source_key(url)
-    collection_key = normalize_vector_collection(SCAM_VECTOR_COLLECTION)
+    collection_key = SCAM_VECTOR_COLLECTION
     ids = [str(uuid4()) for _ in docs_list]
     to_store = [
         Document(page_content=doc.page_content, metadata={"url": norm_url}) for doc in docs_list
@@ -385,7 +425,6 @@ def process_source(
     os_name: str,
     version: str,
     source_type: str | None = None,
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
     *,
     source_storage_key: str | None = None,
 ) -> Tuple[int, int, float]:
@@ -413,7 +452,6 @@ def process_source(
         os_name=os_name,
         version=version,
         docs=chunk_docs,
-        vector_collection=vector_collection,
     )
 
 
@@ -423,7 +461,6 @@ def ingest_single_url(
     os: str,
     version: str,
     source_type: str | None = None,
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
     *,
     source_storage_key: str | None = None,
 ) -> IngestSummary:
@@ -503,7 +540,6 @@ def ingest_single_url(
             os_name=os,
             version=version,
             source_type=resolved_source_type,
-            vector_collection=vector_collection,
             source_storage_key=source_storage_key,
         )
         summary.processed_sources += 1
@@ -535,7 +571,6 @@ def ingest_bulk_urls(
     os: str,
     version: str,
     source_type: str | None = None,
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
     *,
     source_storage_key_fn: Callable[[str], str] | None = None,
 ) -> IngestSummary:
@@ -619,7 +654,6 @@ def ingest_bulk_urls(
                 os_name=os,
                 version=version,
                 source_type=resolved_default_source_type,
-                vector_collection=vector_collection,
                 source_storage_key=sk,
             )
             summary.processed_sources += 1
@@ -650,7 +684,6 @@ def ingest_excel(
     platform: str,
     os: str,
     version: str,
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
     *,
     source_storage_key_fn: Callable[[str], str] | None = None,
 ) -> IngestSummary:
@@ -667,7 +700,6 @@ def ingest_excel(
         platform=platform,
         os=os,
         version=version,
-        vector_collection=vector_collection,
         source_storage_key_fn=source_storage_key_fn,
     )
 
@@ -677,7 +709,6 @@ def ingest_pdf(
     platform: str,
     os: str,
     version: str,
-    vector_collection: str = DEFAULT_VECTOR_COLLECTION,
     *,
     source_storage_key: str | None = None,
 ) -> IngestSummary:
@@ -718,7 +749,6 @@ def ingest_pdf(
             platform=platform,
             os_name=os,
             version=version,
-            vector_collection=vector_collection,
             source_storage_key=source_storage_key,
         )
         summary.processed_sources += 1
@@ -747,24 +777,55 @@ def ingest_pdf(
 def ingest_scam_single_url(url: str, source_type: str | None = None) -> IngestSummary:
     """Ingest one URL into the scam collection only: ``metadata.url``, chunk ids, embeddings (no sources/usage)."""
     summary = IngestSummary(input_count=1)
-    _resolve_source_type(url, source_type)
+    resolved_st = _resolve_source_type(url, source_type)
+    key = _normalize_scam_source_key(url)
 
     if not _is_valid_url(url):
         summary.skipped_invalid += 1
-        summary.status = "completed"
+        summary.status = "failed"
+        with SessionLocal() as db:
+            _bootstrap_db(db)
+            sk = key or "(invalid-url)"
+            summary.uuid = _persist_scam_ingestion(
+                db,
+                source_key=sk,
+                source_type=resolved_st,
+                processed=0,
+                skipped=1,
+                failed=0,
+                chunks=0,
+                tokens_used=0,
+                cost_usd=0.0,
+                status="failed",
+            )
         return summary
 
     with SessionLocal() as db:
         _bootstrap_db(db)
-        if _scam_url_already_ingested(db, url):
+        if _scam_already_embedded_in_table(db, key):
             summary.skipped_duplicates += 1
             summary.status = "completed"
+            dup_row = _scam_row_by_key(db, key)
+            if dup_row is not None:
+                summary.uuid = dup_row.uuid
             return summary
 
         markdown = fetch_markdown(url)
         if not markdown.strip():
             summary.failed_sources += 1
-            summary.status = "completed"
+            summary.status = "failed"
+            summary.uuid = _persist_scam_ingestion(
+                db,
+                source_key=key,
+                source_type=resolved_st,
+                processed=0,
+                skipped=0,
+                failed=1,
+                chunks=0,
+                tokens_used=0,
+                cost_usd=0.0,
+                status=None,
+            )
             return summary
 
         inserted, tokens_used, cost_usd = process_scam_source(db, url, markdown)
@@ -773,33 +834,94 @@ def ingest_scam_single_url(url: str, source_type: str | None = None) -> IngestSu
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
         summary.status = "completed"
+        summary.uuid = _persist_scam_ingestion(
+            db,
+            source_key=key,
+            source_type=resolved_st,
+            processed=1,
+            skipped=0,
+            failed=0,
+            chunks=inserted,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            status=None,
+        )
     return summary
 
 
 def ingest_scam_bulk_urls(urls: List[str], source_type: str | None = None) -> IngestSummary:
-    _resolve_source_type("https://example.com", source_type)
+    resolved_default = _resolve_source_type("https://example.com", source_type)
     summary = IngestSummary(input_count=len(urls))
 
     with SessionLocal() as db:
         _bootstrap_db(db)
         for raw_url in urls:
             url = (raw_url or "").strip()
+            key = _normalize_scam_source_key(url)
             if not _is_valid_url(url):
                 summary.skipped_invalid += 1
+                summary.uuid = _persist_scam_ingestion(
+                    db,
+                    source_key=key or "(invalid-url)",
+                    source_type=resolved_default,
+                    processed=0,
+                    skipped=1,
+                    failed=0,
+                    chunks=0,
+                    tokens_used=0,
+                    cost_usd=0.0,
+                    status="failed",
+                )
                 continue
-            if _scam_url_already_ingested(db, url):
+            resolved_st = _resolve_source_type(url, source_type)
+            if _scam_already_embedded_in_table(db, key):
                 summary.skipped_duplicates += 1
+                dup_row = _scam_row_by_key(db, key)
+                if dup_row is not None:
+                    summary.uuid = dup_row.uuid
                 continue
+
             markdown = fetch_markdown(url)
             if not markdown.strip():
                 summary.failed_sources += 1
+                summary.uuid = _persist_scam_ingestion(
+                    db,
+                    source_key=key,
+                    source_type=resolved_st,
+                    processed=0,
+                    skipped=0,
+                    failed=1,
+                    chunks=0,
+                    tokens_used=0,
+                    cost_usd=0.0,
+                    status=None,
+                )
                 continue
             inserted, tokens_used, cost_usd = process_scam_source(db, url, markdown)
             summary.processed_sources += 1
             summary.chunks_inserted += inserted
             summary.tokens_used += tokens_used
             summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
-    summary.status = "completed"
+            summary.uuid = _persist_scam_ingestion(
+                db,
+                source_key=key,
+                source_type=resolved_st,
+                processed=1,
+                skipped=0,
+                failed=0,
+                chunks=inserted,
+                tokens_used=tokens_used,
+                cost_usd=cost_usd,
+                status=None,
+            )
+    if summary.processed_sources > 0:
+        summary.status = "completed"
+    elif summary.skipped_duplicates > 0 and summary.failed_sources == 0 and summary.skipped_invalid == 0:
+        summary.status = "completed"
+    elif summary.failed_sources > 0 or summary.skipped_invalid > 0:
+        summary.status = "failed"
+    else:
+        summary.status = "completed"
     return summary
 
 
@@ -816,24 +938,53 @@ def ingest_scam_excel(file_path: str) -> IngestSummary:
 
 def ingest_scam_pdf(file_path: str) -> IngestSummary:
     summary = IngestSummary(input_count=1)
+    source_key = os_module.path.abspath(file_path)
+
     if not os_module.path.exists(file_path):
         summary.failed_sources += 1
-        summary.status = "completed"
+        summary.status = "failed"
+        with SessionLocal() as db:
+            _bootstrap_db(db)
+            summary.uuid = _persist_scam_ingestion(
+                db,
+                source_key=source_key,
+                source_type="pdf",
+                processed=0,
+                skipped=0,
+                failed=1,
+                chunks=0,
+                tokens_used=0,
+                cost_usd=0.0,
+                status=None,
+            )
         return summary
-
-    source_key = os_module.path.abspath(file_path)
 
     with SessionLocal() as db:
         _bootstrap_db(db)
-        if _scam_url_already_ingested(db, source_key):
+        if _scam_already_embedded_in_table(db, source_key):
             summary.skipped_duplicates += 1
             summary.status = "completed"
+            dup_row = _scam_row_by_key(db, source_key)
+            if dup_row is not None:
+                summary.uuid = dup_row.uuid
             return summary
 
         markdown = _extract_pdf_markdown_docling(file_path)
         if not markdown.strip():
             summary.failed_sources += 1
-            summary.status = "completed"
+            summary.status = "failed"
+            summary.uuid = _persist_scam_ingestion(
+                db,
+                source_key=source_key,
+                source_type="pdf",
+                processed=0,
+                skipped=0,
+                failed=1,
+                chunks=0,
+                tokens_used=0,
+                cost_usd=0.0,
+                status=None,
+            )
             return summary
 
         inserted, tokens_used, cost_usd = process_scam_source(db, source_key, markdown)
@@ -842,6 +993,18 @@ def ingest_scam_pdf(file_path: str) -> IngestSummary:
         summary.tokens_used += tokens_used
         summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
         summary.status = "completed"
+        summary.uuid = _persist_scam_ingestion(
+            db,
+            source_key=source_key,
+            source_type="pdf",
+            processed=1,
+            skipped=0,
+            failed=0,
+            chunks=inserted,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            status=None,
+        )
     return summary
 
 
@@ -853,7 +1016,6 @@ if __name__ == "__main__":
         platform="Apple",
         os="iOS",
         version="26",
-        vector_collection="tech",
     )
     print("single_url:", one)
 

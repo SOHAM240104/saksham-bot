@@ -1,11 +1,17 @@
-"""LangChain PGVector + OpenAI embeddings (collections: tech, scam)."""
+"""LangChain PGVector + OpenAI embeddings (separate ``tech`` and scam collections)."""
 
 from __future__ import annotations
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
 
-from settings import DATABASE_URL, DEFAULT_VECTOR_COLLECTION, EMBEDDING_DIMENSIONS, normalize_vector_collection
+from settings import (
+    DATABASE_URL,
+    EMBEDDING_DIMENSIONS,
+    SCAM_VECTOR_COLLECTION,
+    TECH_VECTOR_COLLECTION,
+    normalize_vector_collection,
+)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -21,8 +27,9 @@ def get_embeddings() -> OpenAIEmbeddings:
 
 
 def ensure_pgvector_tables_and_collections() -> None:
-    """Create pgvector extension and ``langchain_pg_*`` tables (via first store init)."""
-    get_vector_store(DEFAULT_VECTOR_COLLECTION)
+    """Create pgvector extension and ``langchain_pg_*`` tables; touch both default collections."""
+    get_vector_store(TECH_VECTOR_COLLECTION)
+    get_vector_store(SCAM_VECTOR_COLLECTION)
 
 
 def get_vector_store(collection_name: str) -> PGVector:

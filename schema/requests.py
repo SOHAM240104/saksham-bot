@@ -25,8 +25,6 @@ class IdentityInput(BaseModel):
 
 SourceType = Literal["url", "pdf"]
 
-VectorCollection = Literal["tech", "scam"]
-
 
 class IdentityOutput(BaseModel):
     id: int
@@ -44,12 +42,24 @@ class IdentityEnvelope(EnvelopeResponse[IdentityOutput]):
 
 
 class TrainURLInput(BaseModel):
+    """Context train: vectors always go to the ``tech`` PGVector collection."""
+
     url: str = Field(..., min_length=1)
     source_type: SourceType | None = None
-    vector_collection: VectorCollection = "tech"
 
 
 class TrainBulkURLsInput(BaseModel):
     urls: list[str] = Field(..., min_length=1)
     source_type: SourceType | None = None
-    vector_collection: VectorCollection = "tech"
+
+
+class ScamTrainURLInput(BaseModel):
+    """Scam pipeline: dedicated collection (e.g. ``scam_kb``); no platform/os/version."""
+
+    url: str = Field(..., min_length=1)
+    source_type: SourceType | None = None
+
+
+class ScamTrainBulkURLsInput(BaseModel):
+    urls: list[str] = Field(..., min_length=1)
+    source_type: SourceType | None = None

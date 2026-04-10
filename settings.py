@@ -12,6 +12,11 @@ def get_env(name: str) -> str:
     return value
 
 
+def get_env_optional(name: str, default: str) -> str:
+    value = os.getenv(name, "").strip()
+    return value if value else default
+
+
 DATABASE_URL = get_env("DATABASE_URL")
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
@@ -21,17 +26,22 @@ ADMIN_TOKEN = get_env("ADMIN_TOKEN")
 # OpenAI text-embedding-3-* reduced dimensions; must match PGVector embedding_length (fixed in code, not env).
 EMBEDDING_DIMENSIONS = 1024
 
-# PGVector collection names (each appears as a row in langchain_pg_collection).
-ALLOWED_VECTOR_COLLECTIONS = frozenset({"tech", "scam"})
-DEFAULT_VECTOR_COLLECTION = "tech"
-SCAM_VECTOR_COLLECTION = "scam"
+# PGVector: two separate collections — tech (full context metadata) vs scam (minimal metadata).
+TECH_VECTOR_COLLECTION = "tech"
+SCAM_VECTOR_COLLECTION = get_env_optional("SCAM_VECTOR_COLLECTION", "scam_kb").lower()
+
+# Valid collection names for get_vector_store (tech train uses only tech; scam pipeline uses SCAM_VECTOR_COLLECTION).
+ALLOWED_PGVECTOR_COLLECTIONS = frozenset({TECH_VECTOR_COLLECTION, SCAM_VECTOR_COLLECTION})
+
+# Back-compat alias for ingestion defaults (tech only).
+DEFAULT_VECTOR_COLLECTION = TECH_VECTOR_COLLECTION
 
 
 def normalize_vector_collection(name: str) -> str:
-    """Return a valid collection key: lowercase ``tech`` or ``scam``."""
+    """Validate PGVector collection name: ``tech`` (contextual RAG) or configured scam collection (e.g. ``scam_kb``)."""
     key = (name or "").strip().lower()
-    if key not in ALLOWED_VECTOR_COLLECTIONS:
+    if key not in ALLOWED_PGVECTOR_COLLECTIONS:
         raise ValueError(
-            f"Invalid vector_collection: {name!r}. Allowed: {sorted(ALLOWED_VECTOR_COLLECTIONS)}"
+            f"Invalid vector_collection: {name!r}. Allowed: {sorted(ALLOWED_PGVECTOR_COLLECTIONS)}"
         )
     return key

@@ -6,7 +6,7 @@ from schema.common import EnvelopeResponse
 
 
 class IngestResponse(BaseModel):
-    uuid: UUID
+    uuid: UUID | None = None
     status: str
     created: str | None = None
     modified: str | None = None
@@ -19,4 +19,25 @@ class IngestResponse(BaseModel):
 
 
 class IngestEnvelope(EnvelopeResponse[IngestResponse]):
+    pass
+
+
+class ScamIngestionItem(BaseModel):
+    uuid: UUID
+    source_key: str
+    source_type: str
+    status: str
+    processed: int
+    skipped: int
+    failed: int
+    chunks: int
+    tokens_used: int
+    cost_usd: float
+    created: str | None = None
+    modified: str | None = None
+    is_archived: bool = False
+    is_deleted: bool = False
+
+
+class ScamIngestionEnvelope(EnvelopeResponse[ScamIngestionItem]):
     pass

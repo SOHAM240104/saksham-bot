@@ -5,38 +5,45 @@ import tempfile
 from collections.abc import Callable
 from uuid import UUID
 
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Security, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Security, UploadFile
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin_token
-from ingestion import IngestSummary, ingest_bulk_urls, ingest_excel, ingest_pdf, ingest_single_url
+from ingestion import (
+    IngestSummary,
+    ingest_bulk_urls,
+    ingest_excel,
+    ingest_pdf,
+    ingest_scam_bulk_urls,
+    ingest_scam_excel,
+    ingest_scam_pdf,
+    ingest_scam_single_url,
+    ingest_single_url,
+)
 from config.database import get_db
 from models.context import OSModel, PlatformModel, VersionModel
-from models.ingestion_records import IngestionUsageModel
-from settings import normalize_vector_collection
+from models.ingestion_records import IngestionUsageModel, ScamIngestionModel
 from schema.requests import (
     ArchiveStatePatchRequest,
     IdentityInput,
     IdentityEnvelope,
     IdentityOutput,
+    ScamTrainBulkURLsInput,
+    ScamTrainURLInput,
     TrainBulkURLsInput,
     TrainURLInput,
     UpdateIngestionUsageRequest,
 )
-from schema.ingestion import IngestEnvelope, IngestResponse
+from schema.ingestion import (
+    IngestEnvelope,
+    IngestResponse,
+    ScamIngestionEnvelope,
+    ScamIngestionItem,
+)
 
 router = APIRouter(dependencies=[Security(require_admin_token)])
 _ALLOWED_USAGE_STATUS = frozenset({"not_started", "in_progress", "completed", "failed"})
-
-
-def _vector_collection_form_or_400(raw: str) -> str:
-    try:
-        return normalize_vector_collection(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _parse_uuid_or_400(raw_uuid: str) -> UUID:
@@ -166,6 +173,49 @@ def _identity_status_for_row(row: PlatformModel | OSModel | VersionModel) -> str
     return "completed"
 
 
+def _scam_row_to_item(row: ScamIngestionModel) -> ScamIngestionItem:
+    return ScamIngestionItem(
+        uuid=row.uuid,
+        source_key=row.source_key,
+        source_type=row.source_type,
+        status=row.status,
+        processed=row.processed,
+        skipped=row.skipped,
+        failed=row.failed,
+        chunks=row.chunks,
+        tokens_used=row.tokens_used,
+        cost_usd=row.cost_usd,
+        created=row.created.isoformat() if row.created else None,
+        modified=row.modified.isoformat() if row.modified else None,
+        is_archived=row.is_archived,
+        is_deleted=row.is_deleted,
+    )
+
+
+def _wrap_scam_rows(rows: list[ScamIngestionModel], status_code: int = 200) -> ScamIngestionEnvelope:
+    return ScamIngestionEnvelope(status_code=status_code, data=[_scam_row_to_item(r) for r in rows])
+
+
+def _run_scam_file_ingestion(
+    file: UploadFile,
+    default_suffix: str,
+    ingest_fn: Callable[..., IngestSummary],
+) -> IngestEnvelope:
+    suffix = os.path.splitext(file.filename or "")[1] or default_suffix
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = tmp.name
+            tmp.write(file.file.read())
+        summary = ingest_fn(temp_path)
+        return _wrap_ingest(summary)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def _to_ingest_response(summary: IngestSummary) -> IngestResponse:
     return IngestResponse(
         uuid=summary.uuid,
@@ -192,7 +242,6 @@ def _run_file_ingestion(
     platform: str,
     os_name: str,
     version: str,
-    vector_collection: str,
 ) -> IngestEnvelope:
     suffix = os.path.splitext(file.filename or "")[1] or default_suffix
     temp_path = ""
@@ -205,7 +254,6 @@ def _run_file_ingestion(
             platform=platform,
             os=os_name,
             version=version,
-            vector_collection=vector_collection,
         )
         return _wrap_ingest(summary)
     except Exception as exc:
@@ -454,7 +502,6 @@ def train_single_url(
         os=os_row.identity,
         version=version_row.identity,
         source_type=payload.source_type,
-        vector_collection=payload.vector_collection,
     )
     return _wrap_ingest(summary)
 
@@ -478,7 +525,6 @@ def train_bulk_urls(
         os=os_row.identity,
         version=version_row.identity,
         source_type=payload.source_type,
-        vector_collection=payload.vector_collection,
     )
     return _wrap_ingest(summary)
 
@@ -493,11 +539,9 @@ def train_excel_endpoint(
     os_uuid: str,
     version_uuid: str,
     file: UploadFile = File(...),
-    vector_collection: Annotated[str, Form()] = "tech",
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
     platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
-    vc = _vector_collection_form_or_400(vector_collection)
     return _run_file_ingestion(
         file=file,
         default_suffix=".xlsx",
@@ -505,7 +549,6 @@ def train_excel_endpoint(
         platform=platform_row.identity,
         os_name=os_row.identity,
         version=version_row.identity,
-        vector_collection=vc,
     )
 
 
@@ -519,11 +562,9 @@ def train_pdf_endpoint(
     os_uuid: str,
     version_uuid: str,
     file: UploadFile = File(...),
-    vector_collection: Annotated[str, Form()] = "tech",
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
     platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
-    vc = _vector_collection_form_or_400(vector_collection)
     return _run_file_ingestion(
         file=file,
         default_suffix=".pdf",
@@ -531,8 +572,51 @@ def train_pdf_endpoint(
         platform=platform_row.identity,
         os_name=os_row.identity,
         version=version_row.identity,
-        vector_collection=vc,
     )
+
+
+@router.post("/scam/train/url", response_model=IngestEnvelope, status_code=200)
+def scam_train_single_url(payload: ScamTrainURLInput) -> IngestEnvelope:
+    summary = ingest_scam_single_url(url=payload.url, source_type=payload.source_type)
+    return _wrap_ingest(summary)
+
+
+@router.post("/scam/train/urls", response_model=IngestEnvelope, status_code=200)
+def scam_train_bulk_urls_endpoint(payload: ScamTrainBulkURLsInput) -> IngestEnvelope:
+    summary = ingest_scam_bulk_urls(urls=payload.urls, source_type=payload.source_type)
+    return _wrap_ingest(summary)
+
+
+@router.post("/scam/train/excel", response_model=IngestEnvelope, status_code=200)
+def scam_train_excel_endpoint(file: UploadFile = File(...)) -> IngestEnvelope:
+    return _run_scam_file_ingestion(file=file, default_suffix=".xlsx", ingest_fn=ingest_scam_excel)
+
+
+@router.post("/scam/train/pdf", response_model=IngestEnvelope, status_code=200)
+def scam_train_pdf_endpoint(file: UploadFile = File(...)) -> IngestEnvelope:
+    return _run_scam_file_ingestion(file=file, default_suffix=".pdf", ingest_fn=ingest_scam_pdf)
+
+
+@router.get("/scam/ingestions", response_model=ScamIngestionEnvelope, status_code=200)
+def list_scam_ingestions(
+    skip: int = 0,
+    limit: int = 100,
+    include_archived: bool = False,
+    include_deleted: bool = False,
+    db: Session = Depends(get_db),
+) -> ScamIngestionEnvelope:
+    query = db.query(ScamIngestionModel)
+    if not include_archived:
+        query = query.filter(ScamIngestionModel.is_archived.is_(False))
+    if not include_deleted:
+        query = query.filter(ScamIngestionModel.is_deleted.is_(False))
+    rows = (
+        query.order_by(ScamIngestionModel.created.desc())
+        .offset(max(0, skip))
+        .limit(min(500, max(1, limit)))
+        .all()
+    )
+    return _wrap_scam_rows(rows, status_code=200)
 
 
 @router.get("/ingestion-usage", response_model=IngestEnvelope, status_code=200)
