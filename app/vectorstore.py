@@ -8,12 +8,11 @@ from langchain_postgres import PGVector
 from settings import (
     DATABASE_URL,
     EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
     SCAM_VECTOR_COLLECTION,
     TECH_VECTOR_COLLECTION,
     normalize_vector_collection,
 )
-
-EMBEDDING_MODEL = "text-embedding-3-small"
 
 _embeddings: OpenAIEmbeddings | None = None
 _vector_stores: dict[str, PGVector] = {}

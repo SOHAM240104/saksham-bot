@@ -23,8 +23,10 @@ if DATABASE_URL.startswith("postgresql://"):
 
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
 
-# OpenAI text-embedding-3-* reduced dimensions; must match PGVector embedding_length (fixed in code, not env).
-EMBEDDING_DIMENSIONS = 1024
+# OpenAI text-embedding-3-large; dimensions must match PGVector embedding_length (fixed in code, not env).
+# Changing dimensions requires a new embedding column / re-ingest or empty collections.
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIMENSIONS = 3072
 
 # PGVector: two separate collections — tech (full context metadata) vs scam (minimal metadata).
 TECH_VECTOR_COLLECTION = "tech"

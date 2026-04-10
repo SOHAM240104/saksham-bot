@@ -23,8 +23,8 @@ from config.database import Base, SessionLocal
 from models.ingestion_records import IngestionUsageModel, ScamIngestionModel, SourceModel
 from settings import SCAM_VECTOR_COLLECTION, TECH_VECTOR_COLLECTION
 
-# OpenAI price for text-embedding-3-small is $0.00002 per 1K tokens (used for estimates only).
-EMBEDDING_COST_PER_1K_TOKENS_USD = 0.00002
+# OpenAI price for text-embedding-3-large is $0.00013 per 1K tokens (used for estimates only).
+EMBEDDING_COST_PER_1K_TOKENS_USD = 0.00013
 # tiktoken cl100k_base aligns with OpenAI embedding tokenization for cost estimates.
 _TIKTOKEN_ENCODING = "cl100k_base"
 
