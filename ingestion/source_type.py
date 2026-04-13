@@ -1,6 +1,7 @@
 """URL validation and source-type resolution for tech and scam pipelines."""
 
 import logging
+import os
 from urllib.parse import urlparse
 
 from .constants import ALLOWED_SOURCE_TYPES
@@ -18,7 +19,14 @@ def is_valid_url(url: str) -> bool:
 
 
 def infer_source_type(source: str) -> str:
-    return "url" if is_valid_url(source) else "pdf"
+    normalized = (source or "").strip().lower()
+    if is_valid_url(source):
+        return "url"
+    if normalized.endswith(".pdf") or os.path.splitext(normalized)[1] == ".pdf":
+        return "pdf"
+    err = ValueError("Unable to infer source_type. Provide source_type explicitly as 'url' or 'pdf'.")
+    logger.warning("%s source=%r", err, source)
+    raise err
 
 
 def resolve_source_type(source: str, source_type: str | None) -> str:

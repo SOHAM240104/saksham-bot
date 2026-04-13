@@ -9,7 +9,6 @@ from schema.common import EnvelopeResponse
 
 class IngestionUsageStatus(str, Enum):
     NOT_STARTED = "not_started"
-    IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
 

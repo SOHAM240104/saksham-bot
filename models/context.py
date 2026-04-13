@@ -1,26 +1,24 @@
-from sqlalchemy import BigInteger, Column, ForeignKey, String, UniqueConstraint
+from sqlalchemy import BigInteger, Column, ForeignKey, UniqueConstraint
 
-from models.base import SqlRecordBase
+from models.base import NamedEntityBase
 
 
-class ContextBaseModel(SqlRecordBase):
+class ContextModelBase(NamedEntityBase):
     __abstract__ = True
 
-    identity = Column("name", String, nullable=False)
 
-
-class PlatformModel(ContextBaseModel):
+class PlatformModel(ContextModelBase):
     __tablename__ = "platforms"
 
 
-class OSModel(ContextBaseModel):
+class OSModel(ContextModelBase):
     __tablename__ = "oses"
     __table_args__ = (UniqueConstraint("platform_id", "name", name="uq_platform_os_name"),)
 
     platform_id = Column(BigInteger, ForeignKey("platforms.id", ondelete="CASCADE"), nullable=False)
 
 
-class VersionModel(ContextBaseModel):
+class VersionModel(ContextModelBase):
     __tablename__ = "versions"
     __table_args__ = (UniqueConstraint("os_id", "name", name="uq_os_version_name"),)
 
