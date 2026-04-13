@@ -1,9 +1,9 @@
 from sqlalchemy import Column, String, Text, UniqueConstraint
 
-from models.base import IngestionMetricsBase, IngestionMetricsMixin, ModelBase
+from models.base import BaseIngestionMetrics, BaseModel, IngestionMetricsMixin
 
 
-class SourceModel(ModelBase):
+class SourceModel(BaseModel):
     __tablename__ = "sources"
     __table_args__ = (UniqueConstraint("source", "type", name="uq_sources_source_type"),)
 
@@ -14,7 +14,7 @@ class SourceModel(ModelBase):
     version = Column(String, nullable=False)
 
 
-class ScamIngestionModel(IngestionMetricsMixin, ModelBase):
+class ScamIngestionModel(IngestionMetricsMixin, BaseModel):
     """Listing and dedup for dedicated scam pipeline (no platform/os/version)."""
 
     __tablename__ = "scam_ingestions"
@@ -24,19 +24,5 @@ class ScamIngestionModel(IngestionMetricsMixin, ModelBase):
     source_type = Column(String, nullable=False)
 
 
-class IngestionUsageModel(IngestionMetricsBase):
+class IngestionUsageModel(BaseIngestionMetrics):
     __tablename__ = "ingestion_usage"
-
-
-class IngestionUsageSummaryModel(IngestionMetricsBase):
-    __tablename__ = "ingestion_usage_summary"
-    __table_args__ = (
-        UniqueConstraint(
-            "source",
-            "source_type",
-            "platform",
-            "os",
-            "version",
-            name="uq_ingestion_usage_summary_source_context",
-        ),
-    )

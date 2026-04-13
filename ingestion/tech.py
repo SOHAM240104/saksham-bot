@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.vectorstore import get_vector_store
 from config.database import SessionLocal
-from models.ingestion_records import IngestionUsageModel, IngestionUsageSummaryModel, SourceModel
+from models.ingestion_records import IngestionUsageModel, SourceModel
 from settings import TECH_VECTOR_COLLECTION
 
 from .chunking import clean_text, semantic_chunk
@@ -123,34 +123,6 @@ def _log_usage(
     db.add(usage)
     db.flush()
 
-    summary_row = (
-        db.query(IngestionUsageSummaryModel)
-        .filter(
-            IngestionUsageSummaryModel.source == source,
-            IngestionUsageSummaryModel.source_type == source_type,
-            IngestionUsageSummaryModel.platform == platform,
-            IngestionUsageSummaryModel.os == operating_system,
-            IngestionUsageSummaryModel.version == version,
-        )
-        .first()
-    )
-    if summary_row is None:
-        summary_row = IngestionUsageSummaryModel(
-            source=source,
-            source_type=source_type,
-            platform=platform,
-            os=operating_system,
-            version=version,
-        )
-        db.add(summary_row)
-    summary_row.processed = processed
-    summary_row.skipped = skipped
-    summary_row.failed = failed
-    summary_row.chunks = chunks
-    summary_row.tokens_used = tokens_used
-    summary_row.cost_usd = cost_usd
-    summary_row.status = status
-    db.flush()
     return usage.uuid, usage.status
 
 

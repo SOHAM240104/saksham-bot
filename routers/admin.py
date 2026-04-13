@@ -1,6 +1,7 @@
 """Admin API routes."""
 
 from fastapi import APIRouter, Depends, File, HTTPException, Security, UploadFile
+from sqlalchemy import and_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,7 @@ from ingestion import (
     ingest_single_url,
 )
 from models.context import OSModel, PlatformModel, VersionModel
-from models.ingestion_records import IngestionUsageModel, IngestionUsageSummaryModel, ScamIngestionModel
+from models.ingestion_records import IngestionUsageModel, ScamIngestionModel
 from schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem
 from schema.requests import (
     IdentityEnvelope,
@@ -58,7 +59,7 @@ def _to_usage_response(row: IngestionUsageModel) -> IngestResponse:
     )
 
 
-@router.post("/platforms", response_model=IdentityEnvelope, status_code=201)
+@router.post("/platforms/cud", response_model=IdentityEnvelope, status_code=201)
 def create_platform(payload: IdentityInput, db: Session = Depends(get_db)) -> IdentityEnvelope:
     try:
         row = PlatformModel(identity=payload.identity)
@@ -71,7 +72,7 @@ def create_platform(payload: IdentityInput, db: Session = Depends(get_db)) -> Id
     return IdentityEnvelope(status_code=201, data=[to_identity_output(row)])
 
 
-@router.get("/platforms", response_model=IdentityEnvelope, status_code=200)
+@router.get("/platforms/list", response_model=IdentityEnvelope, status_code=200)
 def list_platforms(include_deleted: bool = False, db: Session = Depends(get_db)) -> IdentityEnvelope:
     query = db.query(PlatformModel)
     if not include_deleted:
@@ -80,20 +81,20 @@ def list_platforms(include_deleted: bool = False, db: Session = Depends(get_db))
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row) for row in rows])
 
 
-@router.get("/platforms/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
+@router.get("/platforms/list/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
 def get_platform(platform_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
     row = resolve_platform_or_404(db, platform_uuid)
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row)])
 
 
-@router.delete("/platforms/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
+@router.delete("/platforms/cud/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
 def delete_platform(platform_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
     row = resolve_platform_or_404(db, platform_uuid)
     status = soft_delete_and_refresh(db, row)
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row, status=status)])
 
 
-@router.post("/platforms/{platform_uuid}/operating-systems", response_model=IdentityEnvelope, status_code=201)
+@router.post("/platforms/{platform_uuid}/operating-systems/cud", response_model=IdentityEnvelope, status_code=201)
 def create_operating_system(
     platform_uuid: str, payload: IdentityInput, db: Session = Depends(get_db)
 ) -> IdentityEnvelope:
@@ -109,7 +110,7 @@ def create_operating_system(
     return IdentityEnvelope(status_code=201, data=[to_identity_output(row)])
 
 
-@router.get("/platforms/{platform_uuid}/operating-systems", response_model=IdentityEnvelope, status_code=200)
+@router.get("/platforms/{platform_uuid}/operating-systems/list", response_model=IdentityEnvelope, status_code=200)
 def list_operating_systems(
     platform_uuid: str, include_deleted: bool = False, db: Session = Depends(get_db)
 ) -> IdentityEnvelope:
@@ -121,7 +122,7 @@ def list_operating_systems(
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row) for row in rows])
 
 
-@router.get("/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}", response_model=IdentityEnvelope)
+@router.get("/platforms/{platform_uuid}/operating-systems/list/{operating_system_uuid}", response_model=IdentityEnvelope)
 def get_operating_system(
     platform_uuid: str, operating_system_uuid: str, db: Session = Depends(get_db)
 ) -> IdentityEnvelope:
@@ -129,7 +130,7 @@ def get_operating_system(
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row)])
 
 
-@router.delete("/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}", response_model=IdentityEnvelope)
+@router.delete("/platforms/{platform_uuid}/operating-systems/cud/{operating_system_uuid}", response_model=IdentityEnvelope)
 def delete_operating_system(
     platform_uuid: str, operating_system_uuid: str, db: Session = Depends(get_db)
 ) -> IdentityEnvelope:
@@ -139,7 +140,7 @@ def delete_operating_system(
 
 
 @router.post(
-    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/cud",
     response_model=IdentityEnvelope,
     status_code=201,
 )
@@ -159,7 +160,7 @@ def create_version(
 
 
 @router.get(
-    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/list",
     response_model=IdentityEnvelope,
 )
 def list_versions(
@@ -174,7 +175,7 @@ def list_versions(
 
 
 @router.get(
-    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/list/{version_uuid}",
     response_model=IdentityEnvelope,
 )
 def get_version(
@@ -185,7 +186,7 @@ def get_version(
 
 
 @router.delete(
-    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/cud/{version_uuid}",
     response_model=IdentityEnvelope,
 )
 def delete_version(
@@ -292,7 +293,7 @@ def train_pdf(
     return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
 
 
-@router.get("/scam/ingestions", response_model=ScamIngestionEnvelope, status_code=200)
+@router.get("/scam/ingestions/list", response_model=ScamIngestionEnvelope, status_code=200)
 def list_scam_ingestions(
     skip: int = 0, limit: int = 100, include_deleted: bool = False, db: Session = Depends(get_db)
 ) -> ScamIngestionEnvelope:
@@ -323,26 +324,26 @@ def list_scam_ingestions(
     )
 
 
-@router.post("/scam/train/url", response_model=IngestEnvelope, status_code=200)
+@router.post("/scam/train/cud/url", response_model=IngestEnvelope, status_code=200)
 def train_scam_single_url(payload: ScamTrainURLInput) -> IngestEnvelope:
     summary = ingest_scam_single_url(url=payload.url, source_type=payload.source_type)
     return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
 
 
-@router.post("/scam/train/urls", response_model=IngestEnvelope, status_code=200)
+@router.post("/scam/train/cud/urls", response_model=IngestEnvelope, status_code=200)
 def train_scam_bulk_urls(payload: ScamTrainBulkURLsInput) -> IngestEnvelope:
     summary = ingest_scam_bulk_urls(urls=payload.urls, source_type=payload.source_type)
     return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
 
 
-@router.post("/scam/train/excel", response_model=IngestEnvelope, status_code=200)
+@router.post("/scam/train/cud/excel", response_model=IngestEnvelope, status_code=200)
 def train_scam_excel(file: UploadFile = File(...)) -> IngestEnvelope:
     with with_temp_upload_file(file, ".xlsx") as temp_path:
         summary = ingest_scam_excel(temp_path)
     return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
 
 
-@router.post("/scam/train/pdf", response_model=IngestEnvelope, status_code=200)
+@router.post("/scam/train/cud/pdf", response_model=IngestEnvelope, status_code=200)
 def train_scam_pdf(file: UploadFile = File(...)) -> IngestEnvelope:
     with with_temp_upload_file(file, ".pdf") as temp_path:
         summary = ingest_scam_pdf(temp_path)
@@ -360,10 +361,40 @@ def list_ingestion_usage(include_deleted: bool = False, db: Session = Depends(ge
 
 @router.get("/ingestion-usage/summary", response_model=IngestEnvelope, status_code=200)
 def list_ingestion_usage_summary(include_deleted: bool = False, db: Session = Depends(get_db)) -> IngestEnvelope:
-    query = db.query(IngestionUsageSummaryModel)
+    grouped_query = db.query(
+        IngestionUsageModel.source.label("source"),
+        IngestionUsageModel.source_type.label("source_type"),
+        IngestionUsageModel.platform.label("platform"),
+        IngestionUsageModel.os.label("os"),
+        IngestionUsageModel.version.label("version"),
+        func.max(IngestionUsageModel.modified).label("latest_modified"),
+    )
     if not include_deleted:
-        query = query.filter(IngestionUsageSummaryModel.is_deleted.is_(False))
-    rows = query.order_by(IngestionUsageSummaryModel.modified.desc()).all()
+        grouped_query = grouped_query.filter(IngestionUsageModel.is_deleted.is_(False))
+    latest_per_context = grouped_query.group_by(
+        IngestionUsageModel.source,
+        IngestionUsageModel.source_type,
+        IngestionUsageModel.platform,
+        IngestionUsageModel.os,
+        IngestionUsageModel.version,
+    ).subquery()
+
+    rows = (
+        db.query(IngestionUsageModel)
+        .join(
+            latest_per_context,
+            and_(
+                IngestionUsageModel.source == latest_per_context.c.source,
+                IngestionUsageModel.source_type == latest_per_context.c.source_type,
+                IngestionUsageModel.platform == latest_per_context.c.platform,
+                IngestionUsageModel.os == latest_per_context.c.os,
+                IngestionUsageModel.version == latest_per_context.c.version,
+                IngestionUsageModel.modified == latest_per_context.c.latest_modified,
+            ),
+        )
+        .order_by(IngestionUsageModel.modified.desc())
+        .all()
+    )
     return IngestEnvelope(status_code=200, data=[_to_usage_response(row) for row in rows])
 
 

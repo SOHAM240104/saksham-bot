@@ -8,7 +8,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from config.database import Base
 
 
-class ModelBase(Base):
+class BaseModel(Base):
     __abstract__ = True
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -28,14 +28,14 @@ class IngestionMetricsMixin:
     status = Column(String, nullable=False, default="completed")
 
 
-class NamedEntityBase(ModelBase):
+class BaseNamedEntity(BaseModel):
     """Abstract base for entities stored in the `name` column."""
 
     __abstract__ = True
     identity = Column("name", String, nullable=False)
 
 
-class IngestionSourceContextBase(ModelBase):
+class BaseIngestionSourceContext(BaseModel):
     """Abstract base for source/context dimensions used in ingestion tables."""
 
     __abstract__ = True
@@ -46,7 +46,7 @@ class IngestionSourceContextBase(ModelBase):
     version = Column(String, nullable=False)
 
 
-class IngestionMetricsBase(IngestionMetricsMixin, IngestionSourceContextBase):
+class BaseIngestionMetrics(IngestionMetricsMixin, BaseIngestionSourceContext):
     """Abstract base combining ingestion metrics with source/context fields."""
 
     __abstract__ = True

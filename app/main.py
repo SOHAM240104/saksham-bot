@@ -5,14 +5,13 @@ from config import database
 from models import context, ingestion_records  # noqa: F401
 from routers.admin import router as flow_router
 from routers.health import router as health_router
-from settings import validate_embedding_configuration
+
 
 app = FastAPI(title="Ingestion API", version="1.0.0")
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    validate_embedding_configuration()
     database.Base.metadata.create_all(bind=database.engine)
     ensure_pgvector_tables_and_collections()
 
