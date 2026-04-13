@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Literal, Optional
 from uuid import UUID
 
@@ -6,17 +7,17 @@ from pydantic import BaseModel, Field
 from schema.common import EnvelopeResponse
 
 
-class ArchiveStatePatchRequest(BaseModel):
-    """PATCH body for archive state on context entities."""
-
-    is_archived: Optional[bool] = None
+class IngestionUsageStatus(str, Enum):
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class UpdateIngestionUsageRequest(BaseModel):
-    """PATCH body for ingestion usage (archive + optional workflow status)."""
+    """PATCH body for ingestion usage (workflow status)."""
 
-    is_archived: Optional[bool] = None
-    status: Optional[str] = None
+    status: Optional[IngestionUsageStatus] = None
 
 
 class IdentityInput(BaseModel):
@@ -33,7 +34,6 @@ class IdentityOutput(BaseModel):
     identity: str
     created: str | None = None
     modified: str | None = None
-    is_archived: bool = False
     is_deleted: bool = False
 
 

@@ -25,7 +25,6 @@ from config.database import get_db
 from models.context import OSModel, PlatformModel, VersionModel
 from models.ingestion_records import IngestionUsageModel, ScamIngestionModel
 from schema.requests import (
-    ArchiveStatePatchRequest,
     IdentityInput,
     IdentityEnvelope,
     IdentityOutput,
@@ -43,7 +42,6 @@ from schema.ingestion import (
 )
 
 router = APIRouter(dependencies=[Security(require_admin_token)])
-_ALLOWED_USAGE_STATUS = frozenset({"not_started", "in_progress", "completed", "failed"})
 
 
 def _parse_uuid_or_400(raw_uuid: str) -> UUID:
@@ -61,29 +59,29 @@ def _get_platform_by_uuid_or_404(db: Session, platform_uuid: str) -> PlatformMod
     return row
 
 
-def _get_os_by_uuid_or_404(db: Session, platform_id: int, os_uuid: str) -> OSModel:
-    parsed = _parse_uuid_or_400(os_uuid)
+def _get_operating_system_by_uuid_or_404(db: Session, platform_id: int, operating_system_uuid: str) -> OSModel:
+    parsed = _parse_uuid_or_400(operating_system_uuid)
     row = db.query(OSModel).filter(OSModel.platform_id == platform_id, OSModel.uuid == parsed).first()
     if row is None:
-        raise HTTPException(status_code=404, detail="OS not found under platform")
+        raise HTTPException(status_code=404, detail="Operating system not found under platform")
     return row
 
 
-def _get_version_by_uuid_or_404(db: Session, os_id: int, version_uuid: str) -> VersionModel:
+def _get_version_by_uuid_or_404(db: Session, operating_system_id: int, version_uuid: str) -> VersionModel:
     parsed = _parse_uuid_or_400(version_uuid)
-    row = db.query(VersionModel).filter(VersionModel.os_id == os_id, VersionModel.uuid == parsed).first()
+    row = db.query(VersionModel).filter(VersionModel.os_id == operating_system_id, VersionModel.uuid == parsed).first()
     if row is None:
-        raise HTTPException(status_code=404, detail="Version not found under platform and OS")
+        raise HTTPException(status_code=404, detail="Version not found under platform and operating system")
     return row
 
 
 def _resolve_context_or_404(
-    db: Session, platform_uuid: str, os_uuid: str, version_uuid: str
+    db: Session, platform_uuid: str, operating_system_uuid: str, version_uuid: str
 ) -> tuple[PlatformModel, OSModel, VersionModel]:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    version_row = _get_version_by_uuid_or_404(db, os_row.id, version_uuid)
-    return platform_row, os_row, version_row
+    operating_system = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
+    version_row = _get_version_by_uuid_or_404(db, operating_system.id, version_uuid)
+    return platform_row, operating_system, version_row
 
 
 def _get_usage_by_uuid_or_404(db: Session, usage_uuid: str) -> IngestionUsageModel:
@@ -106,7 +104,7 @@ def _insert_platform(db: Session, identity: str) -> PlatformModel:
         raise HTTPException(status_code=409, detail="Platform already exists") from exc
 
 
-def _insert_os(db: Session, platform_id: int, identity: str) -> OSModel:
+def _insert_operating_system(db: Session, platform_id: int, identity: str) -> OSModel:
     try:
         row = OSModel(platform_id=platform_id, identity=identity)
         db.add(row)
@@ -115,28 +113,19 @@ def _insert_os(db: Session, platform_id: int, identity: str) -> OSModel:
         return row
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="OS already exists under platform") from exc
+        raise HTTPException(status_code=409, detail="Operating system already exists under platform") from exc
 
 
-def _insert_version(db: Session, os_id: int, identity: str) -> VersionModel:
+def _insert_version(db: Session, operating_system_id: int, identity: str) -> VersionModel:
     try:
-        row = VersionModel(os_id=os_id, identity=identity)
+        row = VersionModel(os_id=operating_system_id, identity=identity)
         db.add(row)
         db.commit()
         db.refresh(row)
         return row
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Version already exists under platform and OS") from exc
-
-
-def set_archive_state(db: Session, row: object, value: bool):
-    if getattr(row, "is_archived") == value:
-        return row
-    setattr(row, "is_archived", value)
-    db.commit()
-    db.refresh(row)
-    return row
+        raise HTTPException(status_code=409, detail="Version already exists under platform and operating system") from exc
 
 
 def set_deleted_state(db: Session, row: object, value: bool = True):
@@ -150,14 +139,10 @@ def set_deleted_state(db: Session, row: object, value: bool = True):
 
 def _patch_usage(db: Session, row: IngestionUsageModel, payload: UpdateIngestionUsageRequest) -> IngestionUsageModel:
     changed = False
-    if payload.is_archived is not None and row.is_archived != payload.is_archived:
-        row.is_archived = payload.is_archived
-        changed = True
     if payload.status is not None:
-        if payload.status not in _ALLOWED_USAGE_STATUS:
-            raise HTTPException(status_code=400, detail=f"Invalid status. Allowed: {sorted(_ALLOWED_USAGE_STATUS)}")
-        if row.status != payload.status:
-            row.status = payload.status
+        value = payload.status.value
+        if row.status != value:
+            row.status = value
             changed = True
     if changed:
         db.commit()
@@ -168,35 +153,10 @@ def _patch_usage(db: Session, row: IngestionUsageModel, payload: UpdateIngestion
 def _identity_status_for_row(row: PlatformModel | OSModel | VersionModel) -> str:
     if row.is_deleted:
         return "deleted"
-    if row.is_archived:
-        return "archived"
     return "completed"
 
 
-def _scam_row_to_item(row: ScamIngestionModel) -> ScamIngestionItem:
-    return ScamIngestionItem(
-        uuid=row.uuid,
-        source_key=row.source_key,
-        source_type=row.source_type,
-        status=row.status,
-        processed=row.processed,
-        skipped=row.skipped,
-        failed=row.failed,
-        chunks=row.chunks,
-        tokens_used=row.tokens_used,
-        cost_usd=row.cost_usd,
-        created=row.created.isoformat() if row.created else None,
-        modified=row.modified.isoformat() if row.modified else None,
-        is_archived=row.is_archived,
-        is_deleted=row.is_deleted,
-    )
-
-
-def _wrap_scam_rows(rows: list[ScamIngestionModel], status_code: int = 200) -> ScamIngestionEnvelope:
-    return ScamIngestionEnvelope(status_code=status_code, data=[_scam_row_to_item(r) for r in rows])
-
-
-def _run_scam_file_ingestion(
+def run_scam_training_file_ingestion(
     file: UploadFile,
     default_suffix: str,
     ingest_fn: Callable[..., IngestSummary],
@@ -296,7 +256,6 @@ def _wrap_identity(row: PlatformModel | OSModel | VersionModel, status_code: int
                 identity=row.identity,
                 created=row.created.isoformat() if row.created else None,
                 modified=row.modified.isoformat() if row.modified else None,
-                is_archived=row.is_archived,
                 is_deleted=row.is_deleted,
             )
         ],
@@ -316,12 +275,33 @@ def _wrap_identity_rows(
                 identity=row.identity,
                 created=row.created.isoformat() if row.created else None,
                 modified=row.modified.isoformat() if row.modified else None,
-                is_archived=row.is_archived,
                 is_deleted=row.is_deleted,
             )
             for row in rows
         ],
     )
+
+
+def _scam_row_to_item(row: ScamIngestionModel) -> ScamIngestionItem:
+    return ScamIngestionItem(
+        uuid=row.uuid,
+        source_key=row.source_key,
+        source_type=row.source_type,
+        status=row.status,
+        processed=row.processed,
+        skipped=row.skipped,
+        failed=row.failed,
+        chunks=row.chunks,
+        tokens_used=row.tokens_used,
+        cost_usd=row.cost_usd,
+        created=row.created.isoformat() if row.created else None,
+        modified=row.modified.isoformat() if row.modified else None,
+        is_deleted=row.is_deleted,
+    )
+
+
+def _wrap_scam_rows(rows: list[ScamIngestionModel], status_code: int = 200) -> ScamIngestionEnvelope:
+    return ScamIngestionEnvelope(status_code=status_code, data=[_scam_row_to_item(r) for r in rows])
 
 
 @router.post("/platforms", response_model=IdentityEnvelope, status_code=201)
@@ -332,13 +312,10 @@ def create_platform(payload: IdentityInput, db: Session = Depends(get_db)) -> Id
 
 @router.get("/platforms", response_model=IdentityEnvelope, status_code=200)
 def list_platforms(
-    include_archived: bool = False,
     include_deleted: bool = False,
     db: Session = Depends(get_db),
 ) -> IdentityEnvelope:
     query = db.query(PlatformModel)
-    if not include_archived:
-        query = query.filter(PlatformModel.is_archived.is_(False))
     if not include_deleted:
         query = query.filter(PlatformModel.is_deleted.is_(False))
     rows = query.order_by(PlatformModel.created.desc()).all()
@@ -351,15 +328,6 @@ def get_platform(platform_uuid: str, db: Session = Depends(get_db)) -> IdentityE
     return _wrap_identity_rows([row], status_code=200)
 
 
-@router.patch("/platforms/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
-def patch_platform(
-    platform_uuid: str, payload: ArchiveStatePatchRequest, db: Session = Depends(get_db)
-) -> IdentityEnvelope:
-    row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    row = set_archive_state(db, row, payload.is_archived) if payload.is_archived is not None else row
-    return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
-
-
 @router.delete("/platforms/{platform_uuid}", response_model=IdentityEnvelope, status_code=200)
 def delete_platform(platform_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
     row = _get_platform_by_uuid_or_404(db, platform_uuid)
@@ -367,139 +335,147 @@ def delete_platform(platform_uuid: str, db: Session = Depends(get_db)) -> Identi
     return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
 
 
-@router.post("/platforms/{platform_uuid}/oses", response_model=IdentityEnvelope, status_code=201)
-def create_os(platform_uuid: str, payload: IdentityInput, db: Session = Depends(get_db)) -> IdentityEnvelope:
+@router.post("/platforms/{platform_uuid}/operating-systems", response_model=IdentityEnvelope, status_code=201)
+def create_operating_system(
+    platform_uuid: str, payload: IdentityInput, db: Session = Depends(get_db)
+) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    row = _insert_os(db, platform_row.id, payload.identity)
+    row = _insert_operating_system(db, platform_row.id, payload.identity)
     return _wrap_identity(row)
 
 
-@router.get("/platforms/{platform_uuid}/oses", response_model=IdentityEnvelope, status_code=200)
-def list_oses(
+@router.get("/platforms/{platform_uuid}/operating-systems", response_model=IdentityEnvelope, status_code=200)
+def list_operating_systems(
     platform_uuid: str,
-    include_archived: bool = False,
     include_deleted: bool = False,
     db: Session = Depends(get_db),
 ) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
     query = db.query(OSModel).filter(OSModel.platform_id == platform_row.id)
-    if not include_archived:
-        query = query.filter(OSModel.is_archived.is_(False))
     if not include_deleted:
         query = query.filter(OSModel.is_deleted.is_(False))
     rows = query.order_by(OSModel.created.desc()).all()
     return _wrap_identity_rows(rows, status_code=200)
 
 
-@router.get("/platforms/{platform_uuid}/oses/{os_uuid}", response_model=IdentityEnvelope, status_code=200)
-def get_os(platform_uuid: str, os_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
+@router.get(
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}",
+    response_model=IdentityEnvelope,
+    status_code=200,
+)
+def get_operating_system(
+    platform_uuid: str, operating_system_uuid: str, db: Session = Depends(get_db)
+) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
+    row = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
     return _wrap_identity_rows([row], status_code=200)
 
 
-@router.patch("/platforms/{platform_uuid}/oses/{os_uuid}", response_model=IdentityEnvelope, status_code=200)
-def patch_os(
-    platform_uuid: str, os_uuid: str, payload: ArchiveStatePatchRequest, db: Session = Depends(get_db)
+@router.delete(
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}",
+    response_model=IdentityEnvelope,
+    status_code=200,
+)
+def delete_operating_system(
+    platform_uuid: str, operating_system_uuid: str, db: Session = Depends(get_db)
 ) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    row = set_archive_state(db, row, payload.is_archived) if payload.is_archived is not None else row
-    return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
-
-
-@router.delete("/platforms/{platform_uuid}/oses/{os_uuid}", response_model=IdentityEnvelope, status_code=200)
-def delete_os(platform_uuid: str, os_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
-    platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
+    row = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
     row = set_deleted_state(db, row, True)
     return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
 
 
-@router.post("/platforms/{platform_uuid}/oses/{os_uuid}/versions", response_model=IdentityEnvelope, status_code=201)
-def create_version(platform_uuid: str, os_uuid: str, payload: IdentityInput, db: Session = Depends(get_db)) -> IdentityEnvelope:
+@router.post(
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions",
+    response_model=IdentityEnvelope,
+    status_code=201,
+)
+def create_version(
+    platform_uuid: str,
+    operating_system_uuid: str,
+    payload: IdentityInput,
+    db: Session = Depends(get_db),
+) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    row = _insert_version(db, os_row.id, payload.identity)
+    operating_system = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
+    row = _insert_version(db, operating_system.id, payload.identity)
     return _wrap_identity(row)
 
 
-@router.get("/platforms/{platform_uuid}/oses/{os_uuid}/versions", response_model=IdentityEnvelope, status_code=200)
+@router.get(
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions",
+    response_model=IdentityEnvelope,
+    status_code=200,
+)
 def list_versions(
     platform_uuid: str,
-    os_uuid: str,
-    include_archived: bool = False,
+    operating_system_uuid: str,
     include_deleted: bool = False,
     db: Session = Depends(get_db),
 ) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    query = db.query(VersionModel).filter(VersionModel.os_id == os_row.id)
-    if not include_archived:
-        query = query.filter(VersionModel.is_archived.is_(False))
+    operating_system = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
+    query = db.query(VersionModel).filter(VersionModel.os_id == operating_system.id)
     if not include_deleted:
         query = query.filter(VersionModel.is_deleted.is_(False))
     rows = query.order_by(VersionModel.created.desc()).all()
     return _wrap_identity_rows(rows, status_code=200)
 
 
-@router.get("/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}", response_model=IdentityEnvelope, status_code=200)
-def get_version(platform_uuid: str, os_uuid: str, version_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
-    platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    row = _get_version_by_uuid_or_404(db, os_row.id, version_uuid)
-    return _wrap_identity_rows([row], status_code=200)
-
-
-@router.patch(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}",
+@router.get(
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}",
     response_model=IdentityEnvelope,
     status_code=200,
 )
-def patch_version(
+def get_version(
     platform_uuid: str,
-    os_uuid: str,
+    operating_system_uuid: str,
     version_uuid: str,
-    payload: ArchiveStatePatchRequest,
     db: Session = Depends(get_db),
 ) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    row = _get_version_by_uuid_or_404(db, os_row.id, version_uuid)
-    row = set_archive_state(db, row, payload.is_archived) if payload.is_archived is not None else row
-    return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
+    operating_system = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
+    row = _get_version_by_uuid_or_404(db, operating_system.id, version_uuid)
+    return _wrap_identity_rows([row], status_code=200)
 
 
 @router.delete(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}",
     response_model=IdentityEnvelope,
     status_code=200,
 )
-def delete_version(platform_uuid: str, os_uuid: str, version_uuid: str, db: Session = Depends(get_db)) -> IdentityEnvelope:
+def delete_version(
+    platform_uuid: str,
+    operating_system_uuid: str,
+    version_uuid: str,
+    db: Session = Depends(get_db),
+) -> IdentityEnvelope:
     platform_row = _get_platform_by_uuid_or_404(db, platform_uuid)
-    os_row = _get_os_by_uuid_or_404(db, platform_row.id, os_uuid)
-    row = _get_version_by_uuid_or_404(db, os_row.id, version_uuid)
+    operating_system = _get_operating_system_by_uuid_or_404(db, platform_row.id, operating_system_uuid)
+    row = _get_version_by_uuid_or_404(db, operating_system.id, version_uuid)
     row = set_deleted_state(db, row, True)
     return _wrap_identity_rows([row], status_code=200, status=_identity_status_for_row(row))
 
 
 @router.post(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}/train/url",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}/train/url",
     response_model=IngestEnvelope,
     status_code=200,
 )
 def train_single_url(
     platform_uuid: str,
-    os_uuid: str,
+    operating_system_uuid: str,
     version_uuid: str,
     payload: TrainURLInput,
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
+    platform_row, operating_system, version_row = _resolve_context_or_404(
+        db, platform_uuid, operating_system_uuid, version_uuid
+    )
     summary = ingest_single_url(
         url=payload.url,
         platform=platform_row.identity,
-        os=os_row.identity,
+        os=operating_system.identity,
         version=version_row.identity,
         source_type=payload.source_type,
     )
@@ -507,22 +483,24 @@ def train_single_url(
 
 
 @router.post(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}/train/urls",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}/train/urls",
     response_model=IngestEnvelope,
     status_code=200,
 )
 def train_bulk_urls(
     platform_uuid: str,
-    os_uuid: str,
+    operating_system_uuid: str,
     version_uuid: str,
     payload: TrainBulkURLsInput,
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
+    platform_row, operating_system, version_row = _resolve_context_or_404(
+        db, platform_uuid, operating_system_uuid, version_uuid
+    )
     summary = ingest_bulk_urls(
         urls=payload.urls,
         platform=platform_row.identity,
-        os=os_row.identity,
+        os=operating_system.identity,
         version=version_row.identity,
         source_type=payload.source_type,
     )
@@ -530,84 +508,63 @@ def train_bulk_urls(
 
 
 @router.post(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}/train/excel",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}/train/excel",
     response_model=IngestEnvelope,
     status_code=200,
 )
-def train_excel_endpoint(
+def train_excel(
     platform_uuid: str,
-    os_uuid: str,
+    operating_system_uuid: str,
     version_uuid: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
+    platform_row, operating_system, version_row = _resolve_context_or_404(
+        db, platform_uuid, operating_system_uuid, version_uuid
+    )
     return _run_file_ingestion(
         file=file,
         default_suffix=".xlsx",
         ingest_fn=ingest_excel,
         platform=platform_row.identity,
-        os_name=os_row.identity,
+        os_name=operating_system.identity,
         version=version_row.identity,
     )
 
 
 @router.post(
-    "/platforms/{platform_uuid}/oses/{os_uuid}/versions/{version_uuid}/train/pdf",
+    "/platforms/{platform_uuid}/operating-systems/{operating_system_uuid}/versions/{version_uuid}/train/pdf",
     response_model=IngestEnvelope,
     status_code=200,
 )
-def train_pdf_endpoint(
+def train_pdf(
     platform_uuid: str,
-    os_uuid: str,
+    operating_system_uuid: str,
     version_uuid: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
-    platform_row, os_row, version_row = _resolve_context_or_404(db, platform_uuid, os_uuid, version_uuid)
+    platform_row, operating_system, version_row = _resolve_context_or_404(
+        db, platform_uuid, operating_system_uuid, version_uuid
+    )
     return _run_file_ingestion(
         file=file,
         default_suffix=".pdf",
         ingest_fn=ingest_pdf,
         platform=platform_row.identity,
-        os_name=os_row.identity,
+        os_name=operating_system.identity,
         version=version_row.identity,
     )
-
-
-@router.post("/scam/train/url", response_model=IngestEnvelope, status_code=200)
-def scam_train_single_url(payload: ScamTrainURLInput) -> IngestEnvelope:
-    summary = ingest_scam_single_url(url=payload.url, source_type=payload.source_type)
-    return _wrap_ingest(summary)
-
-
-@router.post("/scam/train/urls", response_model=IngestEnvelope, status_code=200)
-def scam_train_bulk_urls_endpoint(payload: ScamTrainBulkURLsInput) -> IngestEnvelope:
-    summary = ingest_scam_bulk_urls(urls=payload.urls, source_type=payload.source_type)
-    return _wrap_ingest(summary)
-
-
-@router.post("/scam/train/excel", response_model=IngestEnvelope, status_code=200)
-def scam_train_excel_endpoint(file: UploadFile = File(...)) -> IngestEnvelope:
-    return _run_scam_file_ingestion(file=file, default_suffix=".xlsx", ingest_fn=ingest_scam_excel)
-
-
-@router.post("/scam/train/pdf", response_model=IngestEnvelope, status_code=200)
-def scam_train_pdf_endpoint(file: UploadFile = File(...)) -> IngestEnvelope:
-    return _run_scam_file_ingestion(file=file, default_suffix=".pdf", ingest_fn=ingest_scam_pdf)
 
 
 @router.get("/scam/ingestions", response_model=ScamIngestionEnvelope, status_code=200)
 def list_scam_ingestions(
     skip: int = 0,
     limit: int = 100,
-    include_archived: bool = False,
     include_deleted: bool = False,
     db: Session = Depends(get_db),
 ) -> ScamIngestionEnvelope:
     query = db.query(ScamIngestionModel)
-    if not include_archived:
-        query = query.filter(ScamIngestionModel.is_archived.is_(False))
     if not include_deleted:
         query = query.filter(ScamIngestionModel.is_deleted.is_(False))
     rows = (
@@ -619,15 +576,34 @@ def list_scam_ingestions(
     return _wrap_scam_rows(rows, status_code=200)
 
 
+@router.post("/scam/train/url", response_model=IngestEnvelope, status_code=200)
+def train_scam_single_url(payload: ScamTrainURLInput) -> IngestEnvelope:
+    summary = ingest_scam_single_url(url=payload.url, source_type=payload.source_type)
+    return _wrap_ingest(summary)
+
+
+@router.post("/scam/train/urls", response_model=IngestEnvelope, status_code=200)
+def train_scam_bulk_urls(payload: ScamTrainBulkURLsInput) -> IngestEnvelope:
+    summary = ingest_scam_bulk_urls(urls=payload.urls, source_type=payload.source_type)
+    return _wrap_ingest(summary)
+
+
+@router.post("/scam/train/excel", response_model=IngestEnvelope, status_code=200)
+def train_scam_excel(file: UploadFile = File(...)) -> IngestEnvelope:
+    return run_scam_training_file_ingestion(file=file, default_suffix=".xlsx", ingest_fn=ingest_scam_excel)
+
+
+@router.post("/scam/train/pdf", response_model=IngestEnvelope, status_code=200)
+def train_scam_pdf(file: UploadFile = File(...)) -> IngestEnvelope:
+    return run_scam_training_file_ingestion(file=file, default_suffix=".pdf", ingest_fn=ingest_scam_pdf)
+
+
 @router.get("/ingestion-usage", response_model=IngestEnvelope, status_code=200)
 def list_ingestion_usage(
-    include_archived: bool = False,
     include_deleted: bool = False,
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
     query = db.query(IngestionUsageModel)
-    if not include_archived:
-        query = query.filter(IngestionUsageModel.is_archived.is_(False))
     if not include_deleted:
         query = query.filter(IngestionUsageModel.is_deleted.is_(False))
     rows = query.order_by(IngestionUsageModel.created.desc()).all()
@@ -641,7 +617,7 @@ def get_ingestion_usage(usage_uuid: str, db: Session = Depends(get_db)) -> Inges
 
 
 @router.patch("/ingestion-usage/{usage_uuid}", response_model=IngestEnvelope, status_code=200)
-def patch_ingestion_usage_endpoint(
+def patch_ingestion_usage(
     usage_uuid: str, payload: UpdateIngestionUsageRequest, db: Session = Depends(get_db)
 ) -> IngestEnvelope:
     row = _get_usage_by_uuid_or_404(db, usage_uuid)

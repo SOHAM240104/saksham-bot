@@ -1,21 +1,12 @@
-from uuid import uuid4
+from sqlalchemy import BigInteger, Column, ForeignKey, String, UniqueConstraint
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, String, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID
-
-from config.database import Base
+from models.base import SqlRecordBase
 
 
-class ContextBaseModel(Base):
+class ContextBaseModel(SqlRecordBase):
     __abstract__ = True
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    uuid = Column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid4)
     identity = Column("name", String, nullable=False)
-    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-    is_archived = Column(Boolean, nullable=False, default=False)
-    is_deleted = Column(Boolean, nullable=False, default=False)
 
 
 class PlatformModel(ContextBaseModel):

@@ -35,7 +35,6 @@ class ScamIngestionItem(BaseModel):
     cost_usd: float
     created: str | None = None
     modified: str | None = None
-    is_archived: bool = False
     is_deleted: bool = False
 
 

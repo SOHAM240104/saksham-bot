@@ -1,23 +1,9 @@
-from uuid import uuid4
+from sqlalchemy import Column, Float, Integer, String, Text, UniqueConstraint
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID
-
-from config.database import Base
+from models.base import SqlRecordBase
 
 
-class IngestionBaseModel(Base):
-    __abstract__ = True
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    uuid = Column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid4)
-    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-    is_archived = Column(Boolean, nullable=False, default=False)
-    is_deleted = Column(Boolean, nullable=False, default=False)
-
-
-class SourceModel(IngestionBaseModel):
+class SourceModel(SqlRecordBase):
     __tablename__ = "sources"
 
     source = Column(Text, nullable=False, unique=True)
@@ -27,7 +13,7 @@ class SourceModel(IngestionBaseModel):
     version = Column(String, nullable=False)
 
 
-class ScamIngestionModel(IngestionBaseModel):
+class ScamIngestionModel(SqlRecordBase):
     """Listing and dedup for dedicated scam pipeline (no platform/os/version)."""
 
     __tablename__ = "scam_ingestions"
@@ -44,7 +30,7 @@ class ScamIngestionModel(IngestionBaseModel):
     status = Column(String, nullable=False, default="completed")
 
 
-class IngestionUsageModel(IngestionBaseModel):
+class IngestionUsageModel(SqlRecordBase):
     __tablename__ = "ingestion_usage"
 
     source = Column(Text, nullable=False)

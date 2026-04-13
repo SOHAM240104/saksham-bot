@@ -23,10 +23,18 @@ if DATABASE_URL.startswith("postgresql://"):
 
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
 
-# OpenAI text-embedding-3-large; dimensions must match PGVector embedding_length (fixed in code, not env).
-# Changing dimensions requires a new embedding column / re-ingest or empty collections.
+# OpenAI text-embedding-3-large with dimensions=1024 only (must match PGVector embedding_length everywhere).
+# This project does not support other sizes; changing requires coordinated code + DB / re-ingest.
 EMBEDDING_MODEL = "text-embedding-3-large"
-EMBEDDING_DIMENSIONS = 3072
+EMBEDDING_DIMENSIONS = 1024
+
+
+def validate_embedding_configuration() -> None:
+    """Fail fast if embedding vector size is not the single supported value."""
+    if EMBEDDING_DIMENSIONS != 1024:
+        raise RuntimeError(
+            f"EMBEDDING_DIMENSIONS is 1024 for this service (got {EMBEDDING_DIMENSIONS!r})."
+        )
 
 # PGVector: two separate collections — tech (full context metadata) vs scam (minimal metadata).
 TECH_VECTOR_COLLECTION = "tech"
