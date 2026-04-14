@@ -11,9 +11,9 @@ from uuid import UUID
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from models.context import OSModel, PlatformModel, VersionModel
-from schema.ingestion import IngestResponse
-from schema.requests import IdentityOutput
+from app.models.context import OSModel, PlatformModel, VersionModel
+from app.schema.ingestion import IngestResponse
+from app.schema.requests import IdentityOutput
 
 
 def parse_uuid_or_bad_request(value: str) -> UUID:

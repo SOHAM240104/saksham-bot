@@ -5,7 +5,7 @@ from __future__ import annotations
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
 
-from settings import (
+from app.settings import (
     DATABASE_URL,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,

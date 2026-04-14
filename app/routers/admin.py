@@ -6,8 +6,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin_token
-from config.database import get_db
-from ingestion import (
+from app.config.database import get_db
+from app.ingestion import (
     ingest_bulk_urls,
     ingest_excel,
     ingest_pdf,
@@ -17,10 +17,10 @@ from ingestion import (
     ingest_scam_single_url,
     ingest_single_url,
 )
-from models.context import OSModel, PlatformModel, VersionModel
-from models.ingestion_records import IngestionUsageModel, ScamIngestionModel
-from schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem
-from schema.requests import (
+from app.models.context import OSModel, PlatformModel, VersionModel
+from app.models.ingestion_records import IngestionUsageModel, ScamIngestionModel
+from app.schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem
+from app.schema.requests import (
     IdentityEnvelope,
     IdentityInput,
     ScamTrainBulkURLsInput,

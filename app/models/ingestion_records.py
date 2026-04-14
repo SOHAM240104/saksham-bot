@@ -1,6 +1,6 @@
 from sqlalchemy import Column, String, Text, UniqueConstraint
 
-from models.base import BaseIngestionMetrics, BaseModel, IngestionMetricsMixin
+from app.models.base import BaseIngestionMetrics, BaseModel, IngestionMetricsMixin
 
 
 class SourceModel(BaseModel):

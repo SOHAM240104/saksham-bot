@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from schema.common import EnvelopeResponse
+from app.schema.common import EnvelopeResponse
 
 
 class IngestionUsageStatus(str, Enum):

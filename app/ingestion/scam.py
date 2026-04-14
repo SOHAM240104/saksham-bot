@@ -11,9 +11,9 @@ from langchain_core.documents import Document
 from sqlalchemy.orm import Session
 
 from app.vectorstore import get_vector_store
-from config.database import SessionLocal
-from models.ingestion_records import ScamIngestionModel
-from settings import SCAM_VECTOR_COLLECTION
+from app.config.database import SessionLocal
+from app.models.ingestion_records import ScamIngestionModel
+from app.settings import SCAM_VECTOR_COLLECTION
 
 from .chunking import clean_text, semantic_chunk
 from .crawl import extract_pdf_markdown, fetch_markdown

@@ -2,7 +2,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from schema.common import EnvelopeResponse
+from app.schema.common import EnvelopeResponse
 
 
 class IngestResponse(BaseModel):

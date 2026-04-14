@@ -1,6 +1,6 @@
 from sqlalchemy import BigInteger, Column, ForeignKey, UniqueConstraint
 
-from models.base import BaseNamedEntity
+from app.models.base import BaseNamedEntity
 
 
 class BaseContextModel(BaseNamedEntity):

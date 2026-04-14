@@ -5,7 +5,7 @@ from uuid import uuid4
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 
-from config.database import Base
+from app.config.database import Base
 
 
 class BaseModel(Base):
