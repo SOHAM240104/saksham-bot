@@ -28,7 +28,7 @@ def derive_ingestion_status(processed: int, skipped: int, failed: int) -> str:
     if failed > 0 and processed == 0:
         return "failed"
     if skipped > 0 and processed == 0:
-        return "not_started"
+        return "pending"
     return "completed"
 
 

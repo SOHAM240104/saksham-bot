@@ -193,7 +193,7 @@ def ingest_bulk_urls(
                     version=version,
                     tokens_used=0,
                     cost_usd=0.0,
-                    status="not_started",
+                    status="pending",
                 )
                 db.commit()
                 return
@@ -210,7 +210,7 @@ def ingest_bulk_urls(
                     version=version,
                     tokens_used=0,
                     cost_usd=0.0,
-                    status="not_started",
+                    status="pending",
                 )
                 db.commit()
                 return

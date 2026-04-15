@@ -110,7 +110,7 @@ def ingest_scam_bulk_urls(urls: List[str], source_type: str | None = None) -> In
                     source_type=resolved_source_type,
                     tokens_used=0,
                     cost_usd=0.0,
-                    status="not_started",
+                    status="pending",
                 )
                 db.commit()
                 return

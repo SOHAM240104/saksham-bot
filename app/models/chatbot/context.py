@@ -17,7 +17,7 @@ class PlatformModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "platforms"
+    __tablename__ = "chatbot_platforms"
 
     oses = relationship(
         "OSModel",
@@ -41,15 +41,15 @@ class OSModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "oses"
+    __tablename__ = "chatbot_operating_systems"
     __table_args__ = (
-        UniqueConstraint("platform_id", "identity", name="uq_platform_os_identity"),
+        UniqueConstraint("platform_id", "identity", name="uq_chatbot_platform_os_identity"),
     )
 
     platform_id = Column(
         Integer,
-        ForeignKey("platforms.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("chatbot_platforms.id", ondelete="CASCADE"),
+        nullable=True,
     )
 
     versions = relationship(
@@ -74,13 +74,19 @@ class VersionModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "versions"
+    __tablename__ = "chatbot_versions"
     __table_args__ = (
-        UniqueConstraint("os_id", "identity", name="uq_os_version_identity"),
+        UniqueConstraint("identity", "platform_id", "os_id", name="uq_chatbot_platform_os_version_identity"),
+    )
+
+    platform_id = Column(
+        Integer,
+        ForeignKey("chatbot_platforms.id", ondelete="CASCADE"),
+        nullable=True,
     )
 
     os_id = Column(
         Integer,
-        ForeignKey("oses.id", ondelete="CASCADE"),
+        ForeignKey("chatbot_operating_systems.id", ondelete="CASCADE"),
         nullable=False,
     )

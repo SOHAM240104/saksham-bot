@@ -1,9 +1,11 @@
-from sqlalchemy import Column, String, Text, Integer, Float, ForeignKey, UniqueConstraint, Enum as SAEnum
+from sqlalchemy import Column, String, Integer, Numeric, ForeignKey, UniqueConstraint, Enum as SAEnum
 from sqlalchemy.orm import relationship, backref
 
 from app.models.base import BaseModel
 
-INGESTION_STATUS_ENUM = SAEnum("not_started", "completed", "failed", name="ingestion_status")
+SOURCE_TYPE_ENUM = SAEnum("url", "pdf", name="source_type")
+INGESTION_STATUS_ENUM = SAEnum("pending", "completed", "failed", name="ingestion_status")
+URL_MAX_LENGTH = 255
 
 
 # -------------------------------
@@ -23,17 +25,17 @@ class ScamIngestionModel(BaseModel):
         Char        - status
     """
 
-    __tablename__ = "scam_ingestions"
+    __tablename__ = "chatbot_scam_ingestions"
     __table_args__ = (
-        UniqueConstraint("url", name="uq_scam_ingestions_url"),
+        UniqueConstraint("url", name="uq_chatbot_scam_ingestions_url"),
     )
 
-    url = Column(Text, nullable=True, unique=True)
-    source_type = Column(String, nullable=False)
-    tokens_used = Column(Integer, default=0, nullable=False)
-    cost_usd = Column(Float, default=0.0, nullable=False)
+    url = Column(String(URL_MAX_LENGTH), nullable=True, unique=True)
+    source_type = Column(SOURCE_TYPE_ENUM, default="url", nullable=False)
+    tokens_used = Column(Integer, nullable=True)
+    cost_usd = Column(Numeric(10, 2), nullable=True)
 
-    status = Column(INGESTION_STATUS_ENUM, default="completed", nullable=False)
+    status = Column(INGESTION_STATUS_ENUM, default="pending", nullable=False)
 
 
 # -------------------------------
@@ -53,20 +55,20 @@ class IngestionUsageModel(BaseModel):
         Char        - status
     """
 
-    __tablename__ = "ingestion"
+    __tablename__ = "chatbot_tech_ingestions"
 
     # URL-driven ingestions can set url/source_type; other ingestion types may keep them null.
-    url = Column(Text, nullable=True, unique=True)
-    source_type = Column(String, nullable=True)
+    url = Column(String(URL_MAX_LENGTH), nullable=True, unique=True)
+    source_type = Column(SOURCE_TYPE_ENUM, default="url", nullable=False)
 
-    platform_id = Column(Integer, ForeignKey("platforms.id", ondelete="SET NULL"), nullable=True)
-    os_id = Column(Integer, ForeignKey("oses.id", ondelete="SET NULL"), nullable=True)
-    version_id = Column(Integer, ForeignKey("versions.id", ondelete="SET NULL"), nullable=True)
+    platform_id = Column(Integer, ForeignKey("chatbot_platforms.id", ondelete="CASCADE"), nullable=True)
+    os_id = Column(Integer, ForeignKey("chatbot_operating_systems.id", ondelete="CASCADE"), nullable=False)
+    version_id = Column(Integer, ForeignKey("chatbot_versions.id", ondelete="CASCADE"), nullable=False)
 
     platform = relationship("PlatformModel", backref=backref("related_ingestions", lazy="dynamic"))
     os = relationship("OSModel", backref=backref("related_ingestions", lazy="dynamic"))
     version = relationship("VersionModel", backref=backref("related_ingestions", lazy="dynamic"))
-    tokens_used = Column(Integer, default=0, nullable=False)
-    cost_usd = Column(Float, default=0.0, nullable=False)
+    tokens_used = Column(Integer, nullable=True)
+    cost_usd = Column(Numeric(10, 2), nullable=True)
 
-    status = Column(INGESTION_STATUS_ENUM, default="completed", nullable=False)
+    status = Column(INGESTION_STATUS_ENUM, default="pending", nullable=False)
