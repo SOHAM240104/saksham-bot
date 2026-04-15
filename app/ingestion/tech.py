@@ -1,4 +1,4 @@
-"""Tech (contextual) pipeline: sources + ``tech`` PGVector collection + usage rows."""
+"""Tech (contextual) pipeline: ``tech`` PGVector collection + ingestion rows."""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from langchain_core.documents import Document
 from sqlalchemy.orm import Session
 
 from app.vectorstore import get_vector_store
-from config.database import SessionLocal
-from models.ingestion_records import IngestionUsageModel, SourceModel
-from settings import TECH_VECTOR_COLLECTION
+from app.config.base import SessionLocal
+from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
+from app.models.chatbot.ingestion_records import IngestionUsageModel
+from app.settings import TECH_VECTOR_COLLECTION
 
 from .chunking import clean_text, semantic_chunk
 from .crawl import extract_pdf_markdown, fetch_markdown
@@ -25,37 +26,38 @@ from .token_cost import estimate_embedding_tokens_and_cost
 logger = logging.getLogger(__name__)
 
 
-def _url_exists(db: Session, source: str, source_type: str) -> bool:
-    return db.query(SourceModel.id).filter(SourceModel.type == source_type, SourceModel.source == source).first() is not None
+def _resolve_context_ids(db: Session, platform: str, operating_system: str, version: str) -> tuple[int | None, int | None, int | None]:
+    platform_row = db.query(PlatformModel).filter(PlatformModel.identity == platform).first()
+    if platform_row is None:
+        return None, None, None
+
+    os_row = (
+        db.query(OSModel)
+        .filter(OSModel.platform_id == platform_row.id, OSModel.identity == operating_system)
+        .first()
+    )
+    if os_row is None:
+        return int(platform_row.id), None, None
+
+    version_row = db.query(VersionModel).filter(VersionModel.os_id == os_row.id, VersionModel.identity == version).first()
+    version_id = int(version_row.id) if version_row is not None else None
+    return int(platform_row.id), int(os_row.id), version_id
 
 
-def _insert_source(
-    db: Session,
-    source: str,
-    source_type: str,
-    platform: str,
-    operating_system: str,
-    version: str,
-) -> int:
-    existing = db.query(SourceModel).filter(SourceModel.source == source, SourceModel.type == source_type).first()
-    if existing is not None:
-        if existing.platform != platform:
-            existing.platform = platform
-        if existing.os != operating_system:
-            existing.os = operating_system
-        if existing.version != version:
-            existing.version = version
-        db.flush()
-        return int(existing.id)
-
-    row = SourceModel(source=source, type=source_type, platform=platform, os=operating_system, version=version)
-    db.add(row)
-    db.flush()
-    return int(row.id)
+def _url_exists(db: Session, url: str, source_type: str) -> bool:
+    return (
+        db.query(IngestionUsageModel.id)
+        .filter(
+            IngestionUsageModel.url == url,
+            IngestionUsageModel.source_type == source_type,
+            IngestionUsageModel.is_deleted.is_(False),
+        )
+        .first()
+        is not None
+    )
 
 
 def _insert_chunks(
-    source_id: int,
     source_value: str,
     source_type: str,
     platform: str,
@@ -73,7 +75,6 @@ def _insert_chunks(
         meta = dict(doc.metadata or {})
         meta.update(
             {
-                "source_id": source_id,
                 "source": source_value,
                 "source_type": source_type,
                 "platform": platform,
@@ -92,30 +93,22 @@ def _insert_chunks(
 
 def _log_usage(
     db: Session,
-    source: str,
+    url: str,
     source_type: str,
     platform: str,
     operating_system: str,
     version: str,
-    processed: int,
-    skipped: int,
-    failed: int,
-    chunks: int,
     tokens_used: int,
     cost_usd: float,
+    status: str,
 ) -> tuple[UUID, str]:
-    status = derive_ingestion_status(processed=processed, skipped=skipped, failed=failed)
-
+    platform_id, os_id, version_id = _resolve_context_ids(db, platform, operating_system, version)
     usage = IngestionUsageModel(
-        source=source,
+        url=url,
         source_type=source_type,
-        platform=platform,
-        os=operating_system,
-        version=version,
-        processed=processed,
-        skipped=skipped,
-        failed=failed,
-        chunks=chunks,
+        platform_id=platform_id,
+        os_id=os_id,
+        version_id=version_id,
         tokens_used=tokens_used,
         cost_usd=cost_usd,
         status=status,
@@ -141,19 +134,10 @@ def process_source(
     if not clean:
         return 0, 0, 0.0
 
+    _ = source_storage_key  # retained for API compatibility
     resolved_source_type = resolve_source_type(source, source_type)
-    row_source = source_storage_key if source_storage_key is not None else source
-    source_id = _insert_source(
-        db=db,
-        source=row_source,
-        source_type=resolved_source_type,
-        platform=platform,
-        operating_system=operating_system,
-        version=version,
-    )
     chunk_docs = semantic_chunk(clean, source_value=source)
     return _insert_chunks(
-        source_id=source_id,
         source_value=source,
         source_type=resolved_source_type,
         platform=platform,
@@ -202,17 +186,14 @@ def ingest_bulk_urls(
                 stats.skipped_invalid += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
-                    source=source_value,
+                    url=source_value,
                     source_type=resolved_source_type,
                     platform=platform,
                     operating_system=operating_system,
                     version=version,
-                    processed=0,
-                    skipped=1,
-                    failed=0,
-                    chunks=0,
                     tokens_used=0,
                     cost_usd=0.0,
+                    status="pending",
                 )
                 db.commit()
                 return
@@ -222,17 +203,14 @@ def ingest_bulk_urls(
                 stats.skipped_duplicates += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
-                    source=url,
+                    url=url,
                     source_type=resolved_source_type,
                     platform=platform,
                     operating_system=operating_system,
                     version=version,
-                    processed=0,
-                    skipped=1,
-                    failed=0,
-                    chunks=0,
                     tokens_used=0,
                     cost_usd=0.0,
+                    status="pending",
                 )
                 db.commit()
                 return
@@ -242,17 +220,14 @@ def ingest_bulk_urls(
                 stats.failed += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
-                    source=url,
+                    url=url,
                     source_type=resolved_source_type,
                     platform=platform,
                     operating_system=operating_system,
                     version=version,
-                    processed=0,
-                    skipped=0,
-                    failed=1,
-                    chunks=0,
                     tokens_used=0,
                     cost_usd=0.0,
+                    status="failed",
                 )
                 db.commit()
                 return
@@ -270,21 +245,17 @@ def ingest_bulk_urls(
             )
             summary.uuid, summary.status = _log_usage(
                 db=db,
-                source=url,
+                url=url,
                 source_type=resolved_source_type,
                 platform=platform,
                 operating_system=operating_system,
                 version=version,
-                processed=1,
-                skipped=0,
-                failed=0,
-                chunks=inserted,
                 tokens_used=tokens_used,
                 cost_usd=cost_usd,
+                status="completed",
             )
             db.commit()
             stats.processed += 1
-            stats.chunks += inserted
             stats.tokens_used += tokens_used
             stats.cost_usd = round(stats.cost_usd + cost_usd, 8)
 
@@ -298,17 +269,14 @@ def ingest_bulk_urls(
                 stats.failed += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
-                    source=source_value,
+                    url=source_value,
                     source_type=resolved_source_type,
                     platform=platform,
                     operating_system=operating_system,
                     version=version,
-                    processed=0,
-                    skipped=0,
-                    failed=1,
-                    chunks=0,
                     tokens_used=0,
                     cost_usd=0.0,
+                    status="failed",
                 )
                 db.commit()
             except Exception:
@@ -323,7 +291,6 @@ def ingest_bulk_urls(
     summary.skipped_invalid = stats.skipped_invalid
     summary.skipped_duplicates = stats.skipped_duplicates
     summary.failed_sources = stats.failed
-    summary.chunks_inserted = stats.chunks
     summary.tokens_used = stats.tokens_used
     summary.cost_usd = stats.cost_usd
     summary.status = derive_ingestion_status(
@@ -373,17 +340,14 @@ def ingest_pdf(
                 summary.failed_sources += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
-                    source=source_value,
+                    url=source_value,
                     source_type="pdf",
                     platform=platform,
                     operating_system=operating_system,
                     version=version,
-                    processed=0,
-                    skipped=0,
-                    failed=1,
-                    chunks=0,
                     tokens_used=0,
                     cost_usd=0.0,
+                    status="failed",
                 )
                 db.commit()
                 return summary
@@ -399,21 +363,17 @@ def ingest_pdf(
             )
             summary.uuid, summary.status = _log_usage(
                 db=db,
-                source=source_value,
+                url=source_value,
                 source_type="pdf",
                 platform=platform,
                 operating_system=operating_system,
                 version=version,
-                processed=1,
-                skipped=0,
-                failed=0,
-                chunks=inserted,
                 tokens_used=tokens_used,
                 cost_usd=cost_usd,
+                status="completed",
             )
             db.commit()
             summary.processed_sources += 1
-            summary.chunks_inserted += inserted
             summary.tokens_used += tokens_used
             summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
             return summary
@@ -423,17 +383,14 @@ def ingest_pdf(
             summary.failed_sources += 1
             summary.uuid, summary.status = _log_usage(
                 db=db,
-                source=source_value,
+                url=source_value,
                 source_type="pdf",
                 platform=platform,
                 operating_system=operating_system,
                 version=version,
-                processed=0,
-                skipped=0,
-                failed=1,
-                chunks=0,
                 tokens_used=0,
                 cost_usd=0.0,
+                status="failed",
             )
             db.commit()
             return summary

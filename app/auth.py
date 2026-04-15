@@ -1,7 +1,7 @@
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from settings import ADMIN_TOKEN
+from app.settings import ADMIN_TOKEN
 
 _bearer_scheme = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
 
