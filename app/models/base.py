@@ -47,23 +47,4 @@ class BaseNamedEntity(BaseModel):
 
     __abstract__ = True
 
-    identity = Column(String, nullable=False, index=True)
-
-
-# -------------------------------
-# Source Context (converted)
-# -------------------------------
-
-class BaseIngestionSourceContext(BaseModel):
-    """
-    Stores ingestion source metadata and normalized context ids.
-    """
-
-    __abstract__ = True
-
-    url = Column(Text, nullable=False)
-    source_type = Column(String, nullable=False)
-
-    platform_id = Column(Integer, nullable=True)
-    os_id = Column(Integer, nullable=True)
-    version_id = Column(Integer, nullable=True)
+    identity = Column(String, nullable=False, index=True, unique=True)

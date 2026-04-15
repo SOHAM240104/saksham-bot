@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Text, Integer, Float, ForeignKey, UniqueConstraint, Enum as SAEnum
 from sqlalchemy.orm import relationship, backref
 
-from app.models.base import BaseIngestionSourceContext, BaseModel
+from app.models.base import BaseModel
 
 INGESTION_STATUS_ENUM = SAEnum("not_started", "completed", "failed", name="ingestion_status")
 
@@ -28,7 +28,7 @@ class ScamIngestionModel(BaseModel):
         UniqueConstraint("url", name="uq_scam_ingestions_url"),
     )
 
-    url = Column(Text, nullable=True)
+    url = Column(Text, nullable=True, unique=True)
     source_type = Column(String, nullable=False)
     tokens_used = Column(Integer, default=0, nullable=False)
     cost_usd = Column(Float, default=0.0, nullable=False)
@@ -40,7 +40,7 @@ class ScamIngestionModel(BaseModel):
 # Ingestion Usage Model
 # -------------------------------
 
-class IngestionUsageModel(BaseIngestionSourceContext):
+class IngestionUsageModel(BaseModel):
     """
     IngestionUsageModel tracks detailed ingestion usage across
     sources with platform and version context.
@@ -48,15 +48,15 @@ class IngestionUsageModel(BaseIngestionSourceContext):
     ********************* Model Fields *********************
         PK          - id
         FK          - platform_id, os_id, version_id
-        Char/Text   - source, source_type
+        Char/Text   - url, source_type
         Numeric     - tokens_used, cost_usd
         Char        - status
     """
 
     __tablename__ = "ingestion"
 
-    # URL-driven ingestions can set source/source_type; other ingestion types may keep them null.
-    url = Column(Text, nullable=True)
+    # URL-driven ingestions can set url/source_type; other ingestion types may keep them null.
+    url = Column(Text, nullable=True, unique=True)
     source_type = Column(String, nullable=True)
 
     platform_id = Column(Integer, ForeignKey("platforms.id", ondelete="SET NULL"), nullable=True)
