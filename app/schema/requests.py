@@ -43,11 +43,17 @@ class IdentityEnvelope(EnvelopeResponse[IdentityOutput]):
 class TrainURLInput(BaseModel):
     """Context train: vectors always go to the ``tech`` PGVector collection."""
 
+    platform: str = Field(..., min_length=1)
+    operating_system: str = Field(..., min_length=1)
+    version: str = Field(..., min_length=1)
     url: str = Field(..., min_length=1)
     source_type: SourceType | None = None
 
 
 class TrainBulkURLsInput(BaseModel):
+    platform: str = Field(..., min_length=1)
+    operating_system: str = Field(..., min_length=1)
+    version: str = Field(..., min_length=1)
     urls: list[str] = Field(..., min_length=1)
     source_type: SourceType | None = None
 

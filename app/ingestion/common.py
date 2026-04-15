@@ -38,7 +38,6 @@ class BulkExecutionStats:
     skipped_invalid: int = 0
     skipped_duplicates: int = 0
     failed: int = 0
-    chunks: int = 0
     tokens_used: int = 0
     cost_usd: float = 0.0
 

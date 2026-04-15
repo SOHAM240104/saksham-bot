@@ -1,52 +1,69 @@
-"""Shared SQLAlchemy declarative bases used across model modules."""
+# base_ingestion.py
 
-from uuid import uuid4
-
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, func
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import Column, DateTime, Boolean, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import declarative_base
 
-from app.config.database import Base
+Base = declarative_base()
 
 
 class BaseModel(Base):
+    """
+    Minimal shared base model.
+
+    ********************* Model Fields *********************
+        PK          - id
+        Unique      - uuid
+        Datetime    - created, modified
+        Boolean     - is_active, is_deleted
+    """
     __abstract__ = True
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    uuid = Column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid4)
-    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-    is_deleted = Column(Boolean, nullable=False, default=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uuid = Column(UUID(as_uuid=True), default=uuid.uuid4, unique=True, nullable=False)
+
+    created = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    modified = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    is_active = Column(Boolean, default=True)
+    is_deleted = Column(Boolean, default=False)
 
 
-class IngestionMetricsMixin:
-    processed = Column(Integer, nullable=False, default=0)
-    skipped = Column(Integer, nullable=False, default=0)
-    failed = Column(Integer, nullable=False, default=0)
-    chunks = Column(Integer, nullable=False, default=0)
-    tokens_used = Column(Integer, nullable=False, default=0)
-    cost_usd = Column(Float, nullable=False, default=0.0)
-    status = Column(String, nullable=False, default="completed")
-
+# -------------------------------
+# Identity Entity (converted)
+# -------------------------------
 
 class BaseNamedEntity(BaseModel):
-    """Abstract base for entities stored in the `name` column."""
+    """
+    Abstract entity with identity field.
+    Used for normalized identity tables.
+    """
 
     __abstract__ = True
-    identity = Column("name", String, nullable=False)
 
+    identity = Column(String, nullable=False, index=True)
+
+
+# -------------------------------
+# Source Context (converted)
+# -------------------------------
 
 class BaseIngestionSourceContext(BaseModel):
-    """Abstract base for source/context dimensions used in ingestion tables."""
+    """
+    Stores ingestion source metadata and normalized context ids.
+    """
 
     __abstract__ = True
-    source = Column(Text, nullable=False)
+
+    url = Column(Text, nullable=False)
     source_type = Column(String, nullable=False)
-    platform = Column(String, nullable=False)
-    os = Column(String, nullable=False)
-    version = Column(String, nullable=False)
 
-
-class BaseIngestionMetrics(IngestionMetricsMixin, BaseIngestionSourceContext):
-    """Abstract base combining ingestion metrics with source/context fields."""
-
-    __abstract__ = True
+    platform_id = Column(Integer, nullable=True)
+    os_id = Column(Integer, nullable=True)
+    version_id = Column(Integer, nullable=True)

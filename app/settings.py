@@ -12,15 +12,6 @@ def get_env(name: str) -> str:
     return value
 
 
-def get_env_optional(name: str, default: str) -> str:
-    value = os.getenv(name, "").strip()
-    return value if value else default
-
-
-DATABASE_URL = get_env("DATABASE_URL")
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
 
 # OpenAI text-embedding-3-large with dimensions=1024 only (must match PGVector embedding_length everywhere).
@@ -29,7 +20,7 @@ EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIMENSIONS = 1024
 # PGVector: two separate collections — tech (full context metadata) vs scam (minimal metadata).
 TECH_VECTOR_COLLECTION = "tech"
-SCAM_VECTOR_COLLECTION = get_env_optional("SCAM_VECTOR_COLLECTION", "scam_kb").lower()
+SCAM_VECTOR_COLLECTION = "scam_kb"
 
 # Valid collection names for get_vector_store (tech train uses only tech; scam pipeline uses SCAM_VECTOR_COLLECTION).
 ALLOWED_PGVECTOR_COLLECTIONS = frozenset({TECH_VECTOR_COLLECTION, SCAM_VECTOR_COLLECTION})
@@ -42,15 +33,3 @@ def normalize_vector_collection(name: str) -> str:
             f"Invalid vector_collection: {name!r}. Allowed: {sorted(ALLOWED_PGVECTOR_COLLECTIONS)}"
         )
     return key
-
-
-def validate_embedding_configuration() -> None:
-    """Fail fast if runtime embedding constants drift from supported settings."""
-    if EMBEDDING_MODEL != "text-embedding-3-large":
-        raise RuntimeError(
-            f"Unsupported EMBEDDING_MODEL={EMBEDDING_MODEL!r}; expected 'text-embedding-3-large'."
-        )
-    if EMBEDDING_DIMENSIONS != 1024:
-        raise RuntimeError(
-            f"Unsupported EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS!r}; expected 1024."
-        )

@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from app.models.context import OSModel, PlatformModel, VersionModel
+from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
 from app.schema.ingestion import IngestResponse
 from app.schema.requests import IdentityOutput
 
@@ -39,14 +39,10 @@ def to_ingest_response(summary) -> IngestResponse:
     return IngestResponse(
         uuid=summary.uuid,
         status=summary.status,
-        created=None,
-        modified=None,
-        processed=summary.processed_sources,
-        skipped=summary.skipped_duplicates + summary.skipped_invalid,
-        failed=summary.failed_sources,
-        chunks=summary.chunks_inserted,
         tokens_used=summary.tokens_used,
         cost_usd=summary.cost_usd,
+        created=None,
+        modified=None,
     )
 
 

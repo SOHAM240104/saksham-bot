@@ -1,17 +1,16 @@
 """SQLAlchemy model exports."""
 
-from .base import BaseIngestionMetrics, BaseModel, IngestionMetricsMixin
-from .context import OSModel, PlatformModel, VersionModel
-from .ingestion_records import IngestionUsageModel, ScamIngestionModel, SourceModel
+from .base import BaseIngestionSourceContext, BaseModel, BaseNamedEntity
+from .chatbot.context import OSModel, PlatformModel, VersionModel
+from .chatbot.ingestion_records import IngestionUsageModel, ScamIngestionModel
 
 __all__ = [
     "BaseModel",
-    "IngestionMetricsMixin",
-    "BaseIngestionMetrics",
+    "BaseNamedEntity",
+    "BaseIngestionSourceContext",
     "PlatformModel",
     "OSModel",
     "VersionModel",
-    "SourceModel",
     "ScamIngestionModel",
     "IngestionUsageModel",
 ]

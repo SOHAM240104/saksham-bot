@@ -8,14 +8,10 @@ from app.schema.common import EnvelopeResponse
 class IngestResponse(BaseModel):
     uuid: UUID | None = None
     status: str
+    tokens_used: int = 0
+    cost_usd: float = 0.0
     created: str | None = None
     modified: str | None = None
-    processed: int
-    skipped: int
-    failed: int
-    chunks: int
-    tokens_used: int
-    cost_usd: float
 
 
 class IngestEnvelope(EnvelopeResponse[IngestResponse]):
@@ -24,15 +20,11 @@ class IngestEnvelope(EnvelopeResponse[IngestResponse]):
 
 class ScamIngestionItem(BaseModel):
     uuid: UUID
-    source_key: str
+    url: str
     source_type: str
     status: str
-    processed: int
-    skipped: int
-    failed: int
-    chunks: int
-    tokens_used: int
-    cost_usd: float
+    tokens_used: int = 0
+    cost_usd: float = 0.0
     created: str | None = None
     modified: str | None = None
     is_deleted: bool = False

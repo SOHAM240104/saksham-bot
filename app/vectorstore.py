@@ -5,8 +5,8 @@ from __future__ import annotations
 from langchain_openai import OpenAIEmbeddings
 from langchain_postgres import PGVector
 
+from app.config.base import DATABASE_URL
 from app.settings import (
-    DATABASE_URL,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     SCAM_VECTOR_COLLECTION,
@@ -33,14 +33,15 @@ def ensure_pgvector_tables_and_collections() -> None:
 
 def get_vector_store(collection_name: str) -> PGVector:
     name = normalize_vector_collection(collection_name)
+
     if name not in _vector_stores:
-        _vector_stores[name] = PGVector(
+        store = PGVector(
             embeddings=get_embeddings(),
             collection_name=name,
             connection=DATABASE_URL,
             embedding_length=EMBEDDING_DIMENSIONS,
             use_jsonb=True,
-            create_extension=True,
             async_mode=False,
         )
+        _vector_stores[name] = store
     return _vector_stores[name]
