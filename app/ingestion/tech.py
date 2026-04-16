@@ -194,23 +194,11 @@ def ingest_bulk_urls(
     with SessionLocal() as db:
         def _process(raw_url: str) -> None:
             url = (raw_url or "").strip()
-            resolved_source_type = resolve_source_type(url , source_type)
-            source_value = url or "(invalid-url)"
             if not is_valid_url(url):
                 stats.skipped_invalid += 1
-                summary.uuid, summary.status = _log_usage(
-                    db=db,
-                    url=source_value,
-                    source_type=resolved_source_type,
-                    platform=platform,
-                    operating_system=operating_system,
-                    version=version,
-                    tokens_used=0,
-                    cost_usd=0.0,
-                    status="pending",
-                )
-                db.commit()
+                logger.warning("Invalid URL skipped: %s", url or "(empty)")
                 return
+            resolved_source_type = resolve_source_type(url, source_type)
 
             if _url_exists(db, url, resolved_source_type):
                 stats.skipped_duplicates += 1
@@ -272,7 +260,7 @@ def ingest_bulk_urls(
 
         def _on_exception(raw_url: str) -> None:
             url = (raw_url or "").strip()
-            resolved_source_type = resolve_source_type(url or "https://example.com", source_type)
+            resolved_source_type = resolve_source_type(url, source_type)
             source_value = url or "(invalid-url)"
             try:
                 db.rollback()
