@@ -48,7 +48,7 @@ class OSModel(BaseNamedEntity):
 
     platform_id = Column(
         Integer,
-        ForeignKey("chatbot_platforms.id", ondelete="CASCADE"),
+        ForeignKey("chatbot_platform.id", ondelete="CASCADE"),
         nullable=True,
     )
 
@@ -81,12 +81,12 @@ class VersionModel(BaseNamedEntity):
 
     platform_id = Column(
         Integer,
-        ForeignKey("chatbot_platforms.id", ondelete="CASCADE"),
+        ForeignKey("chatbot_platform.id", ondelete="CASCADE"),
         nullable=True,
     )
 
     os_id = Column(
         Integer,
-        ForeignKey("chatbot_operating_systems.id", ondelete="CASCADE"),
+        ForeignKey("chatbot_os.id", ondelete="CASCADE"),
         nullable=False,
     )
