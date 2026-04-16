@@ -2,10 +2,9 @@
 
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, DateTime, Boolean, Integer, String, Text, ForeignKey
+from sqlalchemy import Column, DateTime, Boolean, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
@@ -31,21 +30,7 @@ class BaseModel(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
-    created_by_id = Column(Integer, ForeignKey("access_user.id"), nullable=True)
-    updated_by_id = Column(Integer, ForeignKey("access_user.id"), nullable=True)
-    deleted_by_id = Column(Integer, ForeignKey("access_user.id"), nullable=True)
 
-    @declared_attr
-    def created_by(cls):
-        return relationship("User", foreign_keys=[cls.created_by_id])
-
-    @declared_attr
-    def updated_by(cls):
-        return relationship("User", foreign_keys=[cls.updated_by_id])
-
-    @declared_attr
-    def deleted_by(cls):
-        return relationship("User", foreign_keys=[cls.deleted_by_id])
 
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)
