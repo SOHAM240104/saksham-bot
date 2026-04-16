@@ -28,7 +28,7 @@ def derive_ingestion_status(processed: int, skipped: int, failed: int) -> str:
     if failed > 0 and processed == 0:
         return "failed"
     if skipped > 0 and processed == 0:
-        return "not_started"
+        return "pending"
     return "completed"
 
 
@@ -38,7 +38,6 @@ class BulkExecutionStats:
     skipped_invalid: int = 0
     skipped_duplicates: int = 0
     failed: int = 0
-    chunks: int = 0
     tokens_used: int = 0
     cost_usd: float = 0.0
 

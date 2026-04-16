@@ -48,7 +48,7 @@ def semantic_chunk(markdown: str, source_value: str) -> List[Document]:
         )
         header_docs = [Document(page_content=markdown, metadata={})]
 
-    chunks: List[Document] = []
+    documents: List[Document] = []
     for doc in header_docs:
         content = (doc.page_content or "").strip()
         if len(content) < 50:
@@ -65,7 +65,7 @@ def semantic_chunk(markdown: str, source_value: str) -> List[Document]:
                     "title": next((line.strip() for line in content.splitlines() if line.strip()), "untitled")[:120],
                 }
             )
-            chunks.append(Document(page_content=content, metadata=metadata))
+            documents.append(Document(page_content=content, metadata=metadata))
             continue
 
         split_docs = FALLBACK_SPLITTER.split_documents([Document(page_content=content, metadata=metadata)])
@@ -76,5 +76,5 @@ def semantic_chunk(markdown: str, source_value: str) -> List[Document]:
                 (line.strip() for line in split_doc.page_content.splitlines() if line.strip()),
                 "untitled",
             )[:120]
-            chunks.append(split_doc)
-    return chunks
+            documents.append(split_doc)
+    return documents

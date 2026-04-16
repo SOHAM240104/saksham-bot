@@ -235,7 +235,7 @@ Ingests scam data from uploaded PDF.
 
 Ingestion Usage Tracking
 GET /ingestion-usage
-Lists ingestion usage records (processed/skipped/failed/chunks/tokens/cost).
+Lists ingestion usage records.
 
 GET /ingestion-usage/{usage_uuid}
 Gets one usage record.
