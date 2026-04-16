@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os as os_module
-from typing import Callable, Iterable, List, Tuple
+from typing import Iterable, List, Tuple
 from uuid import UUID, uuid4
 
 from langchain_core.documents import Document
@@ -150,14 +150,10 @@ def process_source(
     operating_system: str,
     version: str,
     source_type: str | None = None,
-    *,
-    source_storage_key: str | None = None,
 ) -> Tuple[int, int, float]:
     clean = clean_text(text)
     if not clean:
         return 0, 0, 0.0
-
-    _ = source_storage_key  # retained for API compatibility
     resolved_source_type = resolve_source_type(source, source_type)
     chunk_docs = semantic_chunk(clean, source_value=source)
     return _insert_chunks(
@@ -176,8 +172,6 @@ def ingest_single_url(
     operating_system: str,
     version: str,
     source_type: str | None = None,
-    *,
-    source_storage_key: str | None = None,
 ) -> IngestSummary:
     return ingest_bulk_urls(
         [url],
@@ -185,7 +179,6 @@ def ingest_single_url(
         operating_system=operating_system,
         version=version,
         source_type=source_type,
-        source_storage_key_fn=(lambda _: source_storage_key) if source_storage_key is not None else None,
     )
 
 
@@ -195,8 +188,6 @@ def ingest_bulk_urls(
     operating_system: str,
     version: str,
     source_type: str | None = None,
-    *,
-    source_storage_key_fn: Callable[[str], str] | None = None,
 ) -> IngestSummary:
     summary = IngestSummary(input_count=len(urls))
     stats = IngestionRunStats()
@@ -221,8 +212,7 @@ def ingest_bulk_urls(
                 db.commit()
                 return
 
-            row_key = source_storage_key_fn(url) if source_storage_key_fn is not None else url
-            if _url_exists(db, row_key, resolved_source_type):
+            if _url_exists(db, url, resolved_source_type):
                 stats.skipped_duplicates += 1
                 summary.uuid, summary.status = _log_usage(
                     db=db,
@@ -255,7 +245,6 @@ def ingest_bulk_urls(
                 db.commit()
                 return
 
-            storage_key = source_storage_key_fn(url) if source_storage_key_fn is not None else None
             inserted, tokens_used, cost_usd = process_source(
                 db=db,
                 source=url,
@@ -264,7 +253,6 @@ def ingest_bulk_urls(
                 operating_system=operating_system,
                 version=version,
                 source_type=resolved_source_type,
-                source_storage_key=storage_key,
             )
             summary.uuid, summary.status = _log_usage(
                 db=db,
@@ -329,8 +317,6 @@ def ingest_excel(
     platform: str,
     operating_system: str,
     version: str,
-    *,
-    source_storage_key_fn: Callable[[str], str] | None = None,
 ) -> IngestSummary:
     urls = read_excel_urls(file_path, logger, "tech")
     return ingest_bulk_urls(
@@ -338,7 +324,6 @@ def ingest_excel(
         platform=platform,
         operating_system=operating_system,
         version=version,
-        source_storage_key_fn=source_storage_key_fn,
     )
 
 
@@ -347,8 +332,6 @@ def ingest_pdf(
     platform: str,
     operating_system: str,
     version: str,
-    *,
-    source_storage_key: str | None = None,
 ) -> IngestSummary:
     summary = IngestSummary(input_count=1)
     if not os_module.path.exists(file_path):
@@ -382,7 +365,6 @@ def ingest_pdf(
                 platform=platform,
                 operating_system=operating_system,
                 version=version,
-                source_storage_key=source_storage_key,
             )
             summary.uuid, summary.status = _log_usage(
                 db=db,
