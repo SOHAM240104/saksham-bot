@@ -102,7 +102,30 @@ def _log_usage(
     cost_usd: float,
     status: str,
 ) -> tuple[UUID, str]:
+
     platform_id, os_id, version_id = _resolve_context_ids(db, platform, operating_system, version)
+
+    existing = (
+        db.query(IngestionUsageModel)
+        .filter(
+            IngestionUsageModel.url == url,
+            IngestionUsageModel.source_type == source_type,
+            IngestionUsageModel.is_deleted.is_(False),
+        )
+        .first()
+    )
+
+    if existing:
+        existing.tokens_used = tokens_used
+        existing.cost_usd = cost_usd
+        existing.status = status
+        existing.platform_id = platform_id
+        existing.os_id = os_id
+        existing.version_id = version_id
+
+        db.flush()
+        return existing.uuid, existing.status
+
     usage = IngestionUsageModel(
         url=url,
         source_type=source_type,
@@ -180,7 +203,7 @@ def ingest_bulk_urls(
     with SessionLocal() as db:
         def _process(raw_url: str) -> None:
             url = (raw_url or "").strip()
-            resolved_source_type = resolve_source_type(url or "https://example.com", source_type)
+            resolved_source_type = resolve_source_type(url , source_type)
             source_value = url or "(invalid-url)"
             if not is_valid_url(url):
                 stats.skipped_invalid += 1
