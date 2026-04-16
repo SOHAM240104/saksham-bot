@@ -61,9 +61,9 @@ class IngestionUsageModel(BaseModel):
     url = Column(String(URL_MAX_LENGTH), nullable=True, unique=True)
     source_type = Column(SOURCE_TYPE_ENUM, default="url", nullable=False)
 
-    platform_id = Column(Integer, ForeignKey("chatbot_platforms.id", ondelete="CASCADE"), nullable=True)
-    os_id = Column(Integer, ForeignKey("chatbot_operating_systems.id", ondelete="CASCADE"), nullable=False)
-    version_id = Column(Integer, ForeignKey("chatbot_versions.id", ondelete="CASCADE"), nullable=False)
+    platform_id = Column(Integer, ForeignKey("chatbot_platform.id", ondelete="CASCADE"), nullable=True)
+    os_id = Column(Integer, ForeignKey("chatbot_os.id", ondelete="CASCADE"), nullable=False)
+    version_id = Column(Integer, ForeignKey("chatbot_version.id", ondelete="CASCADE"), nullable=False)
 
     platform = relationship("PlatformModel", backref=backref("related_ingestions", lazy="dynamic"))
     os = relationship("OSModel", backref=backref("related_ingestions", lazy="dynamic"))
