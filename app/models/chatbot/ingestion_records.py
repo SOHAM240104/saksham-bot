@@ -25,7 +25,7 @@ class ScamIngestionModel(BaseModel):
         Char        - status
     """
 
-    __tablename__ = "chatbot_scam_ingestions"
+    __tablename__ = "chatbot_scamingestion"
     __table_args__ = (
         UniqueConstraint("url", name="uq_chatbot_scam_ingestions_url"),
     )
@@ -55,7 +55,7 @@ class IngestionUsageModel(BaseModel):
         Char        - status
     """
 
-    __tablename__ = "chatbot_tech_ingestions"
+    __tablename__ = "chatbot_techingestion"
 
     # URL-driven ingestions can set url/source_type; other ingestion types may keep them null.
     url = Column(String(URL_MAX_LENGTH), nullable=True, unique=True)

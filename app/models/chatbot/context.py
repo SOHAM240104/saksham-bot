@@ -17,7 +17,7 @@ class PlatformModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "chatbot_platforms"
+    __tablename__ = "chatbot_platform"
 
     oses = relationship(
         "OSModel",
@@ -41,7 +41,7 @@ class OSModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "chatbot_operating_systems"
+    __tablename__ = "chatbot_os"
     __table_args__ = (
         UniqueConstraint("platform_id", "identity", name="uq_chatbot_platform_os_identity"),
     )
@@ -74,7 +74,7 @@ class VersionModel(BaseNamedEntity):
         Char        - identity
     """
 
-    __tablename__ = "chatbot_versions"
+    __tablename__ = "chatbot_version"
     __table_args__ = (
         UniqueConstraint("identity", "platform_id", "os_id", name="uq_chatbot_platform_os_version_identity"),
     )
