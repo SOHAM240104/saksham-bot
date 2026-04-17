@@ -23,19 +23,33 @@ CRAWL4AI_CONFIG = CrawlerRunConfig(markdown_generator=_crawl4ai_md_generator)
 async def _fetch_one_url(url: str) -> str:
     try:
         async with AsyncWebCrawler() as crawler:
-            result = await crawler.arun(url, config=CRAWL4AI_CONFIG)
+            result = await asyncio.wait_for(
+                crawler.arun(url, config=CRAWL4AI_CONFIG),
+                timeout=15
+            )
+
         if not result or not getattr(result, "success", False):
             return ""
+
         md = getattr(result, "markdown", None)
+
         if md is None:
             return ""
+
         if hasattr(md, "raw_markdown") and md.raw_markdown:
             return md.raw_markdown or ""
+
         if isinstance(md, str):
             return md
+
         return ""
+
+    except asyncio.TimeoutError:
+        logger.warning("Timeout → skipping URL: %s", url)
+        return ""
+
     except Exception:
-        logger.exception("Error during fetching markdown for URL: %s", url)
+        logger.warning("Failed → skipping URL: %s", url)
         return ""
 
 
