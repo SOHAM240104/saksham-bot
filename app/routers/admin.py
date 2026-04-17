@@ -198,7 +198,7 @@ def create_version(
         db.refresh(row)
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Version already exists under platform and operating system") from exc
+        raise HTTPException(status_code=409, detail=f'{exc}') from exc
     return IdentityEnvelope(status_code=201, data=[to_identity_output(row)])
 
 
