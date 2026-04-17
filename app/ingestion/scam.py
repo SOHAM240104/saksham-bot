@@ -101,7 +101,7 @@ def ingest_scam_bulk_urls(urls: List[str], source_type: str | None = None) -> In
         def _process(raw_url: str) -> None:
             url = (raw_url or "").strip()
             normalized_url = _normalize_scam_url(url) or "(invalid-url)"
-            resolved_source_type = resolve_source_type(url or "https://example.com", source_type)
+            resolved_source_type = resolve_source_type(url , source_type)
             if not is_valid_url(url):
                 stats.skipped_invalid += 1
                 summary.uuid = _upsert_scam_ingestion_record(
@@ -153,7 +153,7 @@ def ingest_scam_bulk_urls(urls: List[str], source_type: str | None = None) -> In
         def _on_exception(raw_url: str) -> None:
             url = (raw_url or "").strip()
             normalized_url = _normalize_scam_url(url) or "(invalid-url)"
-            resolved_source_type = resolve_source_type(url or "https://example.com", source_type)
+            resolved_source_type = resolve_source_type(url, source_type)
             try:
                 db.rollback()
                 logger.exception("Scam ingestion failed for source: %s", normalized_url)
