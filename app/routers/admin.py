@@ -70,9 +70,9 @@ def _get_operating_system_or_404(db: Session, platform_row: PlatformModel, opera
     return row
 
 
-def _get_version_or_404(db: Session, operating_system_row: OSModel, version: str) -> VersionModel:
+def _get_version_or_404(db: Session,platform_row: PlatformModel, operating_system_row: OSModel, version: str) -> VersionModel:
     normalized = _normalize_identity(version)
-    row = db.query(VersionModel).filter(VersionModel.os_id == operating_system_row.id, VersionModel.identity == normalized).first()
+    row = db.query(VersionModel).filter(VersionModel.os_id == operating_system_row.id,VersionModel.platform_id == platform_row.id,VersionModel.identity == normalized).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Version not found")
     return row
@@ -95,7 +95,7 @@ def _resolve_context_strict(
 ) -> tuple[PlatformModel, OSModel, VersionModel]:
     platform_row = _get_platform_or_404(db, platform)
     operating_system_row = _get_operating_system_or_404(db, platform_row, operating_system)
-    version_row = _get_version_or_404(db, operating_system_row, version)
+    version_row = _get_version_or_404(db, platform_row, operating_system_row, version)
     return platform_row, operating_system_row, version_row
 
 
@@ -108,7 +108,7 @@ def create_platform(payload: IdentityInput, db: Session = Depends(get_db)) -> Id
         db.refresh(row)
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Platform already exists") from exc
+        raise HTTPException(status_code=409, detail=f"{exc}") from exc
     return IdentityEnvelope(status_code=201, data=[to_identity_output(row)])
 
 
@@ -146,7 +146,7 @@ def create_operating_system(
         db.refresh(row)
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Operating system already exists under platform") from exc
+        raise HTTPException(status_code=409, detail=f"{exc}") from exc
     return IdentityEnvelope(status_code=201, data=[to_identity_output(row)])
 
 
@@ -192,7 +192,8 @@ def create_version(
     platform_row = _get_platform_or_404(db, platform)
     operating_system_row = _get_operating_system_or_404(db, platform_row, operating_system)
     try:
-        row = VersionModel(os_id=operating_system_row.id, identity=_normalize_identity(payload.identity))
+        row = VersionModel(os_id=operating_system_row.id,platform_id=platform_row.id,
+                            identity=_normalize_identity(payload.identity))
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -211,7 +212,7 @@ def list_versions(
 ) -> IdentityEnvelope:
     platform_row = _get_platform_or_404(db, platform)
     operating_system_row = _get_operating_system_or_404(db, platform_row, operating_system)
-    query = db.query(VersionModel).filter(VersionModel.os_id == operating_system_row.id)
+    query = db.query(VersionModel).filter(VersionModel.os_id == operating_system_row.id,VersionModel.platform_id == platform_row.id)
     if not include_deleted:
         query = query.filter(VersionModel.is_deleted.is_(False))
     rows = query.order_by(VersionModel.created.desc()).all()
@@ -227,7 +228,7 @@ def get_version(
 ) -> IdentityEnvelope:
     platform_row = _get_platform_or_404(db, platform)
     operating_system_row = _get_operating_system_or_404(db, platform_row, operating_system)
-    row = _get_version_or_404(db, operating_system_row, version)
+    row = _get_version_or_404(db, platform_row, operating_system_row, version)
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row)])
 
 
@@ -240,7 +241,7 @@ def delete_version(
 ) -> IdentityEnvelope:
     platform_row = _get_platform_or_404(db, platform)
     operating_system_row = _get_operating_system_or_404(db, platform_row, operating_system)
-    row = _get_version_or_404(db, operating_system_row, version)
+    row = _get_version_or_404(db, platform_row, operating_system_row, version)
     status = soft_delete_and_refresh(db, row)
     return IdentityEnvelope(status_code=200, data=[to_identity_output(row, status=status)])
 
