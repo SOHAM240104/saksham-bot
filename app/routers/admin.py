@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Security, UploadFile
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
+from fastapi import BackgroundTasks
 from app.auth import require_admin_token
 from app.config.base import get_db
 from app.ingestion import (
@@ -275,6 +275,7 @@ def train_single_url(
 )
 def train_bulk_urls(
     payload: TrainBulkURLsInput,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> IngestEnvelope:
     platform_row, operating_system, version_row = _resolve_context_strict(
@@ -283,14 +284,22 @@ def train_bulk_urls(
         operating_system=payload.operating_system,
         version=payload.version,
     )
-    summary = ingest_bulk_urls(
+    background_tasks.add_task(ingest_bulk_urls,
         urls=payload.urls,
         platform=platform_row.identity,
         operating_system=operating_system.identity,
         version=version_row.identity,
         source_type=payload.source_type or "url",
     )
-    return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
+
+    return IngestEnvelope(
+    status_code=200,
+    data=[
+        IngestResponse(
+            status="queued"
+        )
+    ]
+)
 
 
 @router.post(
@@ -381,9 +390,23 @@ def train_scam_single_url(payload: ScamTrainURLInput) -> IngestEnvelope:
 
 
 @router.post("/scam/train/cud/urls", response_model=IngestEnvelope, status_code=200)
-def train_scam_bulk_urls(payload: ScamTrainBulkURLsInput) -> IngestEnvelope:
-    summary = ingest_scam_bulk_urls(urls=payload.urls, source_type=payload.source_type or "url")
-    return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
+def train_scam_bulk_urls(
+    payload: ScamTrainBulkURLsInput,
+    background_tasks: BackgroundTasks,
+) -> IngestEnvelope:
+    background_tasks.add_task(
+        ingest_scam_bulk_urls,
+        urls=payload.urls,
+        source_type=payload.source_type or "url",
+    )
+    return IngestEnvelope(
+        status_code=200,
+        data=[
+            IngestResponse(
+                status="queued",
+            )
+        ],
+    )
 
 
 @router.post("/scam/train/cud/excel", response_model=IngestEnvelope, status_code=200)
