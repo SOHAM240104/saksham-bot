@@ -45,7 +45,7 @@ def _resolve_context_ids(db: Session, platform: str, operating_system: str, vers
 
 
 def _url_exists(db: Session, url: str, source_type: str) -> bool:
-    return (
+    existing = (
         db.query(IngestionUsageModel.id)
         .filter(
             IngestionUsageModel.url == url,
@@ -53,8 +53,8 @@ def _url_exists(db: Session, url: str, source_type: str) -> bool:
             IngestionUsageModel.is_deleted.is_(False),
         )
         .first()
-        is not None
     )
+    return existing is not None and existing.status == "completed"
 
 
 def _insert_chunks(
@@ -202,24 +202,12 @@ def ingest_bulk_urls(
 
             if _url_exists(db, url, resolved_source_type):
                 stats.skipped_duplicates += 1
-                summary.uuid, summary.status = _log_usage(
-                    db=db,
-                    url=url,
-                    source_type=resolved_source_type,
-                    platform=platform,
-                    operating_system=operating_system,
-                    version=version,
-                    tokens_used=0,
-                    cost_usd=0.0,
-                    status="pending",
-                )
-                db.commit()
                 return
 
             markdown = fetch_markdown(url)
             if not markdown.strip():
                 stats.failed += 1
-                summary.uuid, summary.status = _log_usage(
+                _log_usage(
                     db=db,
                     url=url,
                     source_type=resolved_source_type,
@@ -231,6 +219,7 @@ def ingest_bulk_urls(
                     status="failed",
                 )
                 db.commit()
+                
                 return
 
             inserted, tokens_used, cost_usd = process_source(
@@ -242,7 +231,7 @@ def ingest_bulk_urls(
                 version=version,
                 source_type=resolved_source_type,
             )
-            summary.uuid, summary.status = _log_usage(
+            _log_usage(
                 db=db,
                 url=url,
                 source_type=resolved_source_type,
@@ -266,7 +255,7 @@ def ingest_bulk_urls(
                 db.rollback()
                 logger.exception("Tech ingestion failed for source: %s", source_value)
                 stats.failed += 1
-                summary.uuid, summary.status = _log_usage(
+                _log_usage(
                     db=db,
                     url=source_value,
                     source_type=resolved_source_type,
@@ -332,7 +321,7 @@ def ingest_pdf(
             markdown = extract_pdf_markdown(file_path)
             if not markdown.strip():
                 summary.failed_sources += 1
-                summary.uuid, summary.status = _log_usage(
+                _log_usage(
                     db=db,
                     url=source_value,
                     source_type="pdf",
@@ -354,7 +343,7 @@ def ingest_pdf(
                 operating_system=operating_system,
                 version=version,
             )
-            summary.uuid, summary.status = _log_usage(
+            _log_usage(
                 db=db,
                 url=source_value,
                 source_type="pdf",
@@ -374,7 +363,7 @@ def ingest_pdf(
             db.rollback()
             logger.exception("Tech PDF ingestion failed: %s", source_value)
             summary.failed_sources += 1
-            summary.uuid, summary.status = _log_usage(
+            _log_usage(
                 db=db,
                 url=source_value,
                 source_type="pdf",

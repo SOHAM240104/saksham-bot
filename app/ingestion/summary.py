@@ -13,5 +13,9 @@ class IngestSummary:
     failed_sources: int = 0
     tokens_used: int = 0
     cost_usd: float = 0.0
-    uuid: UUID | None = None
-    status: str = "completed"
+    status: str = "no_op"
+    results: List[Dict] = field(default_factory=list)
+##[
+  ##{"url": "...", "status": "completed"},
+  ##{"url": "...", "status": "failed"}
+##]
