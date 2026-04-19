@@ -1,6 +1,9 @@
 """Aggregate stats returned from ingestion entrypoints."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
 from uuid import UUID
 
 
@@ -14,8 +17,5 @@ class IngestSummary:
     tokens_used: int = 0
     cost_usd: float = 0.0
     status: str = "no_op"
-    results: List[Dict] = field(default_factory=list)
-##[
-  ##{"url": "...", "status": "completed"},
-  ##{"url": "...", "status": "failed"}
-##]
+    uuid: UUID | None = None
+    results: list[dict[str, Any]] = field(default_factory=list)
