@@ -21,7 +21,7 @@ from app.ingestion import (
 )
 from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
 from app.models.chatbot.ingestion_records import IngestionUsageModel, ScamIngestionModel, TechFile
-from app.settings import TECH_S3_BUCKET
+from app.settings import TECH_S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION_NAME
 from app.schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem,PDFUploadInitEnvelope,PDFUploadInitResponse
 from app.schema.requests import (
     IdentityEnvelope,
@@ -41,7 +41,15 @@ from .common import (
 )
 
 router = APIRouter(dependencies=[Security(require_admin_token)])
-s3 = boto3.client("s3")
+
+s3_kwargs = {}
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    s3_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+    s3_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+if AWS_REGION_NAME:
+    s3_kwargs["region_name"] = AWS_REGION_NAME
+
+s3 = boto3.client("s3", **s3_kwargs)
 
 
 def _to_usage_response(row: IngestionUsageModel) -> IngestResponse:
