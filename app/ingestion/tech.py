@@ -44,17 +44,21 @@ def _resolve_context_ids(db: Session, platform: str, operating_system: str, vers
     return int(platform_row.id), int(os_row.id), version_id
 
 
-def _url_exists(db: Session, url: str, source_type: str) -> bool:
+def _get_usage_row(db: Session, url: str, source_type: str) -> IngestionUsageModel | None:
     return (
-        db.query(IngestionUsageModel.id)
+        db.query(IngestionUsageModel)
         .filter(
             IngestionUsageModel.url == url,
             IngestionUsageModel.source_type == source_type,
             IngestionUsageModel.is_deleted.is_(False),
         )
         .first()
-        is not None
     )
+
+
+def _url_exists(db: Session, url: str, source_type: str) -> bool:
+    row = _get_usage_row(db, url, source_type)
+    return row is not None and row.status == "completed"
 
 
 def _insert_chunks(
@@ -202,24 +206,12 @@ def ingest_bulk_urls(
 
             if _url_exists(db, url, resolved_source_type):
                 stats.skipped_duplicates += 1
-                summary.uuid, summary.status = _log_usage(
-                    db=db,
-                    url=url,
-                    source_type=resolved_source_type,
-                    platform=platform,
-                    operating_system=operating_system,
-                    version=version,
-                    tokens_used=0,
-                    cost_usd=0.0,
-                    status="pending",
-                )
-                db.commit()
                 return
 
             markdown = fetch_markdown(url)
             if not markdown.strip():
                 stats.failed += 1
-                summary.uuid, summary.status = _log_usage(
+                uid, _ = _log_usage(
                     db=db,
                     url=url,
                     source_type=resolved_source_type,
@@ -230,10 +222,12 @@ def ingest_bulk_urls(
                     cost_usd=0.0,
                     status="failed",
                 )
+                summary.uuid = uid
                 db.commit()
+
                 return
 
-            inserted, tokens_used, cost_usd = process_source(
+            _, tokens_used, cost_usd = process_source(
                 db=db,
                 source=url,
                 text=markdown,
@@ -242,7 +236,7 @@ def ingest_bulk_urls(
                 version=version,
                 source_type=resolved_source_type,
             )
-            summary.uuid, summary.status = _log_usage(
+            uid, _ = _log_usage(
                 db=db,
                 url=url,
                 source_type=resolved_source_type,
@@ -253,6 +247,7 @@ def ingest_bulk_urls(
                 cost_usd=cost_usd,
                 status="completed",
             )
+            summary.uuid = uid
             db.commit()
             stats.processed += 1
             stats.tokens_used += tokens_used
@@ -266,7 +261,7 @@ def ingest_bulk_urls(
                 db.rollback()
                 logger.exception("Tech ingestion failed for source: %s", source_value)
                 stats.failed += 1
-                summary.uuid, summary.status = _log_usage(
+                uid, _ = _log_usage(
                     db=db,
                     url=source_value,
                     source_type=resolved_source_type,
@@ -277,6 +272,7 @@ def ingest_bulk_urls(
                     cost_usd=0.0,
                     status="failed",
                 )
+                summary.uuid = uid
                 db.commit()
             except Exception:
                 db.rollback()
@@ -332,7 +328,7 @@ def ingest_pdf(
             markdown = extract_pdf_markdown(file_path)
             if not markdown.strip():
                 summary.failed_sources += 1
-                summary.uuid, summary.status = _log_usage(
+                uid, _ = _log_usage(
                     db=db,
                     url=source_value,
                     source_type="pdf",
@@ -343,10 +339,11 @@ def ingest_pdf(
                     cost_usd=0.0,
                     status="failed",
                 )
+                summary.uuid = uid
                 db.commit()
                 return summary
 
-            inserted, tokens_used, cost_usd = process_source(
+            _, tokens_used, cost_usd = process_source(
                 db=db,
                 source=source_value,
                 text=markdown,
@@ -354,7 +351,7 @@ def ingest_pdf(
                 operating_system=operating_system,
                 version=version,
             )
-            summary.uuid, summary.status = _log_usage(
+            uid, _ = _log_usage(
                 db=db,
                 url=source_value,
                 source_type="pdf",
@@ -365,6 +362,7 @@ def ingest_pdf(
                 cost_usd=cost_usd,
                 status="completed",
             )
+            summary.uuid = uid
             db.commit()
             summary.processed_sources += 1
             summary.tokens_used += tokens_used
@@ -374,7 +372,7 @@ def ingest_pdf(
             db.rollback()
             logger.exception("Tech PDF ingestion failed: %s", source_value)
             summary.failed_sources += 1
-            summary.uuid, summary.status = _log_usage(
+            uid, _ = _log_usage(
                 db=db,
                 url=source_value,
                 source_type="pdf",
@@ -385,5 +383,6 @@ def ingest_pdf(
                 cost_usd=0.0,
                 status="failed",
             )
+            summary.uuid = uid
             db.commit()
             return summary
