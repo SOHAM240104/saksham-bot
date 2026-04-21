@@ -13,6 +13,7 @@ class IngestionUsageStatus(str, Enum):
     FAILED = "failed"
 
 
+
 class UpdateIngestionUsageRequest(BaseModel):
     """PATCH body for ingestion usage (workflow status)."""
 

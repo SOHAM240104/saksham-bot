@@ -13,7 +13,7 @@ def get_env(name: str) -> str:
 
 
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
-
+TECH_S3_BUCKET = os.getenv("TECH_S3_BUCKET", "")
 # OpenAI text-embedding-3-large with dimensions=1024 only (must match PGVector embedding_length everywhere).
 # This project does not support other sizes; changing requires coordinated code + DB / re-ingest.
 EMBEDDING_MODEL = "text-embedding-3-large"

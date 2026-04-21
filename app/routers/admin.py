@@ -1,5 +1,8 @@
 """Admin API routes."""
 
+from uuid import uuid4
+
+import boto3
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Security, UploadFile
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,8 +20,9 @@ from app.ingestion import (
     ingest_single_url,
 )
 from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
-from app.models.chatbot.ingestion_records import IngestionUsageModel, ScamIngestionModel
-from app.schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem
+from app.models.chatbot.ingestion_records import IngestionUsageModel, ScamIngestionModel, TechFile
+from app.settings import TECH_S3_BUCKET
+from app.schema.ingestion import IngestEnvelope, IngestResponse, ScamIngestionEnvelope, ScamIngestionItem,PDFUploadInitEnvelope,PDFUploadInitResponse
 from app.schema.requests import (
     IdentityEnvelope,
     IdentityInput,
@@ -37,6 +41,7 @@ from .common import (
 )
 
 router = APIRouter(dependencies=[Security(require_admin_token)])
+s3 = boto3.client("s3")
 
 
 def _to_usage_response(row: IngestionUsageModel) -> IngestResponse:
@@ -332,7 +337,7 @@ def train_excel(
 
 @router.post(
     "/train/cud/pdf",
-    response_model=IngestEnvelope,
+    response_model=PDFUploadInitEnvelope,
 )
 def train_pdf(
     file: UploadFile = File(...),
@@ -340,21 +345,78 @@ def train_pdf(
     operating_system: str = Form(...),
     version: str = Form(...),
     db: Session = Depends(get_db),
-) -> IngestEnvelope:
+) -> PDFUploadInitEnvelope:
     platform_row, operating_system_row, version_row = _resolve_context_strict(
         db,
         platform=platform,
         operating_system=operating_system,
         version=version,
     )
-    with with_temp_upload_file(file, ".pdf") as temp_path:
-        summary = ingest_pdf(
-            temp_path,
-            platform=platform_row.identity,
-            operating_system=operating_system_row.identity,
-            version=version_row.identity,
+
+    if not TECH_S3_BUCKET:
+        raise HTTPException(
+            status_code=500,
+            detail="TECH_S3_BUCKET is not configured"
         )
-    return IngestEnvelope(status_code=200, data=[to_ingest_response(summary)])
+
+    # generate unique file key
+    file_key = f"uploads/{uuid4().hex}"
+
+    try:
+        s3.upload_fileobj(
+
+            file.file,   
+            TECH_S3_BUCKET,
+            file_key,
+            ExtraArgs={"ContentType": file.content_type},
+    )
+    except Exception as exc:
+         raise HTTPException(500, f"S3 upload failed: {exc}")
+   
+
+    #  create File entry
+    file_row = TechFile(file=file_key)
+    db.add(file_row)
+    db.commit()
+    db.refresh(file_row)
+
+    # create ingestion entry
+    ingestion = IngestionUsageModel(
+        file_id=file_row.id,
+        source_type="pdf",
+        platform_id=platform_row.id,
+        os_id=operating_system_row.id,
+        version_id=version_row.id,
+        status="pending",
+    )
+
+    db.add(ingestion)
+    db.commit()
+    db.refresh(ingestion)
+
+    ingestion_result = ingest_pdf(
+        s3_key=file_key,
+        platform=platform_row.identity,
+        operating_system=operating_system_row.identity,
+        version=version_row.identity,
+        ingestion_id=ingestion.id,
+    )
+
+    db.refresh(ingestion)
+
+    # return response (upload + ingestion info)
+    return PDFUploadInitEnvelope(
+        status_code=200,
+        data=[
+            PDFUploadInitResponse(
+                file_id=file_row.id,
+                upload_url="",
+                file_key=file_key,
+                ingestion_id=ingestion.id,
+                status=ingestion_result.get("status", ingestion.status),
+            )
+        ],
+    )
 
 
 @router.get("/scam/ingestions/list", response_model=ScamIngestionEnvelope, status_code=200)
