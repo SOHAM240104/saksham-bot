@@ -17,7 +17,15 @@ class IngestResponse(BaseModel):
 class IngestEnvelope(EnvelopeResponse[IngestResponse]):
     pass
 
+class PDFUploadInitResponse(BaseModel):
+    file_id: int
+    upload_url: str
+    file_key: str
+    ingestion_id: int
+    status: str
 
+class PDFUploadInitEnvelope(EnvelopeResponse[PDFUploadInitResponse]):
+    pass  
 class ScamIngestionItem(BaseModel):
     uuid: UUID
     url: str

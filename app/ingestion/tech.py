@@ -14,7 +14,7 @@ from app.vectorstore import get_vector_store
 from app.config.base import SessionLocal
 from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
 from app.models.chatbot.ingestion_records import IngestionUsageModel
-from app.settings import TECH_VECTOR_COLLECTION
+from app.settings import TECH_VECTOR_COLLECTION, TECH_S3_BUCKET
 
 from .chunking import clean_text, semantic_chunk
 from .crawl import extract_pdf_markdown, fetch_markdown
@@ -22,7 +22,9 @@ from .common import IngestionRunStats, derive_ingestion_status, process_bulk_ite
 from .source_type import is_valid_url, resolve_source_type
 from .summary import IngestSummary
 from .token_cost import estimate_embedding_tokens_and_cost
+import boto3
 
+s3 = boto3.client("s3")
 logger = logging.getLogger(__name__)
 
 
@@ -310,79 +312,91 @@ def ingest_excel(
         version=version,
     )
 
-
 def ingest_pdf(
-    file_path: str,
+    s3_key: str,
     platform: str,
     operating_system: str,
     version: str,
-) -> IngestSummary:
-    summary = IngestSummary(input_count=1)
-    if not os_module.path.exists(file_path):
-        summary.failed_sources += 1
-        return summary
+    ingestion_id: int,
+):
 
-    source_value = os_module.path.abspath(file_path)
+    import tempfile
+
+    temp_path = None
+
     with SessionLocal() as db:
         try:
-            markdown = extract_pdf_markdown(file_path)
-            if not markdown.strip():
-                summary.failed_sources += 1
-                uid, _ = _log_usage(
-                    db=db,
-                    url=source_value,
-                    source_type="pdf",
-                    platform=platform,
-                    operating_system=operating_system,
-                    version=version,
-                    tokens_used=0,
-                    cost_usd=0.0,
-                    status="failed",
-                )
-                summary.uuid = uid
-                db.commit()
-                return summary
+            # Download from S3
+            s3_obj = s3.get_object(Bucket=TECH_S3_BUCKET, Key=s3_key)
+            file_size = s3_obj.get("ContentLength", 0)
 
+            # Save temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(s3_obj["Body"].read())
+                temp_path = tmp.name
+
+            # Extract
+            markdown = extract_pdf_markdown(temp_path)
+            total_chars = len(markdown)
+
+            ingestion = db.get(IngestionUsageModel, ingestion_id)
+
+            if not markdown.strip():
+                if ingestion:
+                    ingestion.status = "failed"
+                db.commit()
+
+                return {
+                    "failed": True,
+                    "status": "failed",
+                }
+
+            # Process
             _, tokens_used, cost_usd = process_source(
                 db=db,
-                source=source_value,
+                source=s3_key,
                 text=markdown,
                 platform=platform,
                 operating_system=operating_system,
                 version=version,
-            )
-            uid, _ = _log_usage(
-                db=db,
-                url=source_value,
                 source_type="pdf",
-                platform=platform,
-                operating_system=operating_system,
-                version=version,
-                tokens_used=tokens_used,
-                cost_usd=cost_usd,
-                status="completed",
             )
-            summary.uuid = uid
+
+            # Update ingestion
+            if ingestion:
+                ingestion.tokens_used = tokens_used
+                ingestion.cost_usd = cost_usd
+                ingestion.size = file_size
+                ingestion.total_chars = total_chars
+                ingestion.status = "completed"
+
             db.commit()
-            summary.processed_sources += 1
-            summary.tokens_used += tokens_used
-            summary.cost_usd = round(summary.cost_usd + cost_usd, 8)
-            return summary
+
+            return {
+                "failed": False,
+                "status": "completed",
+                "tokens_used": tokens_used,
+                "cost_usd": cost_usd,
+            }
+
         except Exception:
             db.rollback()
-            logger.exception("Tech PDF ingestion failed: %s", source_value)
-            summary.failed_sources += 1
-            uid, _ = _log_usage(
-                db=db,
-                url=source_value,
-                source_type="pdf",
-                platform=platform,
-                operating_system=operating_system,
-                version=version,
-                tokens_used=0,
-                cost_usd=0.0,
-                status="failed",
-            )
-            summary.uuid = uid
+
+            ingestion = db.get(IngestionUsageModel, ingestion_id)
+            if ingestion:
+                ingestion.status = "failed"
+                ingestion.size = 0
+                ingestion.total_chars = 0
+
             db.commit()
-            return summary
+
+            return {
+                "failed": True,
+                "status": "failed",
+                "tokens_used": 0,
+                "cost_usd": 0.0,
+            }
+
+        finally:
+            if temp_path and os_module.path.exists(temp_path):
+                os_module.remove(temp_path)
