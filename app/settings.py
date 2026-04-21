@@ -13,6 +13,9 @@ def get_env(name: str) -> str:
 
 
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION_NAME = os.getenv("AWS_REGION_NAME")
 TECH_S3_BUCKET = os.getenv("TECH_S3_BUCKET", "")
 # OpenAI text-embedding-3-large with dimensions=1024 only (must match PGVector embedding_length everywhere).
 # This project does not support other sizes; changing requires coordinated code + DB / re-ingest.

@@ -14,7 +14,7 @@ from app.vectorstore import get_vector_store
 from app.config.base import SessionLocal
 from app.models.chatbot.context import OSModel, PlatformModel, VersionModel
 from app.models.chatbot.ingestion_records import IngestionUsageModel
-from app.settings import TECH_VECTOR_COLLECTION, TECH_S3_BUCKET
+from app.settings import TECH_VECTOR_COLLECTION, TECH_S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION_NAME
 
 from .chunking import clean_text, semantic_chunk
 from .crawl import extract_pdf_markdown, fetch_markdown
@@ -24,7 +24,16 @@ from .summary import IngestSummary
 from .token_cost import estimate_embedding_tokens_and_cost
 import boto3
 
-s3 = boto3.client("s3")
+
+s3_kwargs = {}
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    s3_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+    s3_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+if AWS_REGION_NAME:
+    s3_kwargs["region_name"] = AWS_REGION_NAME
+
+s3 = boto3.client("s3", **s3_kwargs)
+
 logger = logging.getLogger(__name__)
 
 
