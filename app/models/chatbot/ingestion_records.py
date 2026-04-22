@@ -85,8 +85,6 @@ class IngestionUsageModel(BaseModel):
 
     tokens_used = Column(Integer, nullable=True)
     cost_usd = Column(Numeric(10, 2), nullable=True)
-    size = Column(Integer, default=0, nullable=True)
-    total_chars = Column(Integer, default=0, nullable=True)
 
 
   
