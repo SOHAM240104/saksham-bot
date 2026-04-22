@@ -48,7 +48,7 @@ class TechFile(BaseModel):
     """
     __tablename__ = "chatbot_file"
 
-    file = Column(String(1024), nullable=False)
+    identity = Column(String(1024), nullable=False)
 
 # -------------------------------
 # Ingestion Usage Model

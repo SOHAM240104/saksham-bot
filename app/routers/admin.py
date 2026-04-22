@@ -383,7 +383,7 @@ def train_pdf(
    
 
     #  create File entry
-    file_row = TechFile(file=file_key)
+    file_row = TechFile(identity=file_key)
     db.add(file_row)
     db.commit()
     db.refresh(file_row)
