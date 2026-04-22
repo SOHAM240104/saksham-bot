@@ -337,7 +337,7 @@ def ingest_pdf(
         try:
             # Download from S3
             s3_obj = s3.get_object(Bucket=TECH_S3_BUCKET, Key=s3_key)
-            file_size = s3_obj.get("ContentLength", 0)
+    
 
             # Save temp file
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -346,7 +346,7 @@ def ingest_pdf(
 
             # Extract
             markdown = extract_pdf_markdown(temp_path)
-            total_chars = len(markdown)
+    
 
             ingestion = db.get(IngestionUsageModel, ingestion_id)
 
@@ -375,8 +375,6 @@ def ingest_pdf(
             if ingestion:
                 ingestion.tokens_used = tokens_used
                 ingestion.cost_usd = cost_usd
-                ingestion.size = file_size
-                ingestion.total_chars = total_chars
                 ingestion.status = "completed"
 
             db.commit()
@@ -394,8 +392,6 @@ def ingest_pdf(
             ingestion = db.get(IngestionUsageModel, ingestion_id)
             if ingestion:
                 ingestion.status = "failed"
-                ingestion.size = 0
-                ingestion.total_chars = 0
 
             db.commit()
 
