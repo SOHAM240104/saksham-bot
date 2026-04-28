@@ -1,39 +1,29 @@
-"""SQLAlchemy model exports."""
+"""Public model exports."""
 
+# Core base
 from .base import BaseModel, BaseNamedEntity
-from .config import (
-    GENDER_ENUM,
-    ONBOARDING_TYPE_ENUM,
-    USER_TYPE_ENUM,
-    senior_language_association,
-    senior_relative_association,
-    tech_saathi_language_association,
-)
-from .senior import DeviceModel, LanguageModel, RelativeModel, Senior
-from .techsaathi import TechSaathi
+# Core domain models
 from .user import User
-from .chatbot.context import OSModel, PlatformModel, VersionModel
-from .chatbot.ingestion_records import IngestionUsageModel, ScamIngestionModel
+from .senior import Senior
+from .techsaathi import TechSaathi
+# Supporting models
+from .senior import DeviceModel, Language, Relative
+from .chatbot.context import PlatformModel, OSModel, VersionModel
+# Ingestion
+from .chatbot.ingestion_records import ScamIngestionModel, IngestionUsageModel
 
 __all__ = [
     "BaseModel",
     "BaseNamedEntity",
-    "USER_TYPE_ENUM",
-    "GENDER_ENUM",
-    "ONBOARDING_TYPE_ENUM",
-    "senior_language_association",
-    "senior_relative_association",
-    "tech_saathi_language_association",
     "User",
     "Senior",
     "TechSaathi",
-    "LanguageModel",
-    "RelativeModel",
     "DeviceModel",
+    "Language",
+    "Relative",
     "PlatformModel",
     "OSModel",
     "VersionModel",
     "ScamIngestionModel",
     "IngestionUsageModel",
 ]
-

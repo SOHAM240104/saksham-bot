@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import backref, relationship
 
 from app.models.base import BaseModel
 from app.models.config import USER_TYPE_ENUM
@@ -22,13 +22,13 @@ class User(BaseModel):
 
     senior_profile = relationship(
         "Senior",
-        back_populates="user",
+        backref=backref("user", uselist=False),
         uselist=False,
         cascade="all, delete-orphan",
     )
     tech_saathi_profile = relationship(
         "TechSaathi",
-        back_populates="user",
+        backref=backref("user", uselist=False),
         uselist=False,
         cascade="all, delete-orphan",
     )
