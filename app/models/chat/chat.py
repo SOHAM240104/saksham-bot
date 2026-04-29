@@ -53,6 +53,10 @@ class Thread(BaseModel):
         backref=backref("thread", lazy="select"),  
         cascade="all, delete-orphan"
     )
+    techsaathi = relationship(
+    "TechSaathi",
+    backref=backref("threads", lazy="select")
+)
 
 
 # =========================================================
