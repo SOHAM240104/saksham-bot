@@ -15,7 +15,7 @@ class TechSaathi(BaseModel):
     __tablename__ = "senior_techsaathi"
 
     user_id = Column(Integer, ForeignKey("access_user.id", ondelete="CASCADE"), nullable=False, unique=True)
-    languages = relationship("Language", secondary=tech_saathi_language_association, lazy="dynamic")
+    language = relationship("Language", secondary=tech_saathi_language_association, lazy="dynamic")
 
     def __str__(self):
         return f"{self.user.first_name} [{self.user.is_active}]"
