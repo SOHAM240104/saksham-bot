@@ -58,7 +58,7 @@ class Relative(BaseModel):
     user = relationship("User", backref=backref("relatives", lazy="dynamic"))
 
     def __str__(self):
-        return f"{self.user.first_name} ({self.relationship_name})"
+        return f"{self.user.first_name} ({self.relationship})"
 
 
 class DeviceModel(BaseNamedEntity):
