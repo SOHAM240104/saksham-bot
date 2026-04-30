@@ -21,14 +21,16 @@ class User(BaseModel):
     last_name = Column(String(255), nullable=True)
 
     senior_profile = relationship(
-        "Senior",
-        backref=backref("user", uselist=False),
-        uselist=False,
-        cascade="all, delete-orphan",
+    "Senior",
+    backref=backref("user", uselist=False),
+    foreign_keys="Senior.user_id",   
+    uselist=False,
+    cascade="all, delete-orphan",
     )
     tech_saathi_profile = relationship(
         "TechSaathi",
         backref=backref("user", uselist=False),
+        foreign_keys="TechSaathi.user_id",
         uselist=False,
         cascade="all, delete-orphan",
     )

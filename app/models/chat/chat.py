@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Float, CheckConstraint
+from sqlalchemy import Column, Integer, String, ForeignKey, Float, CheckConstraint,Text
 from sqlalchemy.orm import relationship, backref
 
 
@@ -18,8 +18,11 @@ from app.models.config import (
 class Conversation(BaseModel):
     __tablename__ = "chatbot_conversation"
 
-    language = Column(String,  ForeignKey("administration_language.identity"), nullable=True) 
-    senior_id = Column(Integer, ForeignKey("senior.id"), nullable=True)
+    language_id = Column(Integer, ForeignKey("administration_language.id"), nullable=True)
+    senior_id = Column(Integer, ForeignKey("senior_senior.id"), nullable=True)
+
+    wati_conversation_id = Column(String, nullable=True)
+
 
     threads = relationship(
         "Thread",
@@ -44,7 +47,7 @@ class Thread(BaseModel):
     conversation_id = Column(Integer, ForeignKey("chatbot_conversation.id"), nullable=False)
 
     role = Column(THREAD_ROLE_ENUM, nullable=False)
-    techsaathi_id = Column(Integer, ForeignKey("tech_saathi.id"), nullable=True)
+    tech_saathi_id = Column(Integer, ForeignKey("tech_saathi_techsaathi.id"), nullable=True)
 
     status = Column(THREAD_STATUS_ENUM, nullable=False, default="assigned")#default value what to set?
 
@@ -69,16 +72,20 @@ class Message(BaseModel):
     conversation_id = Column(Integer, ForeignKey("chatbot_conversation.id"), nullable=False)
     thread_id = Column(Integer, ForeignKey("chatbot_thread.id"), nullable=False)
 
-    user_message = Column(String, nullable=False)
+    user_message = Column(Text, nullable=False)
+    tech_saathi_id = Column(Integer, ForeignKey("tech_saathi_techsaathi.id"), nullable=True)
+    
 
-    bot_response = Column(String, nullable=True)
-    tech_saathi_response = Column(String, nullable=True)
+    bot_response = Column(Text, nullable=True)
+    tech_saathi_response = Column(Text, nullable=True)
 
-    template = Column(String, nullable=True)
+    template = Column(Text, nullable=True)
     confidence_score = Column(Float, nullable=True)
 
-    message_source = Column(String, nullable=True)
-    wati_message_id = Column(String, nullable=True)
-
+    message_source = Column(Text , nullable=True)
+    wati_message_id = Column(Text, nullable=True)
   
-    
+    techsaathi = relationship(
+    "TechSaathi",
+    backref=backref("messages", lazy="select")
+)
