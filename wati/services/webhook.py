@@ -16,11 +16,16 @@ logger = logging.getLogger("wati.services.webhook")
 
 
 # =========================================================
-# SEND MESSAGE TO WATI
+# SEND MESSAGE TO WATI (NO STATIC FALLBACKS)
 # =========================================================
 async def send_message(phone: str, message: str) -> bool:
     if not phone:
-        logger.warning("Skipping send_message: phone is missing")
+        logger.warning("Skipping send_message: phone missing")
+        return False
+
+    text = (message or "").strip()
+    if not text:
+        logger.warning("Empty message, not sending")
         return False
 
     url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendSessionMessage/{phone}"
@@ -28,10 +33,6 @@ async def send_message(phone: str, message: str) -> bool:
         "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
         "Content-Type": "application/json",
     }
-
-    text = (message or "").strip()
-    if not text:
-        text = "Please share your issue."
 
     for attempt in range(1, 4):
         try:
@@ -49,38 +50,23 @@ async def send_message(phone: str, message: str) -> bool:
                 return response.status_code < 500
 
         except httpx.TimeoutException:
-            logger.warning("WATI send timeout on attempt %s for %s", attempt, phone)
-            await asyncio.sleep(1.0 * attempt)
+            logger.warning("Timeout attempt %s for %s", attempt, phone)
+            await asyncio.sleep(attempt)
 
         except Exception as exc:
-            logger.exception("WATI send failed on attempt %s: %s", attempt, exc)
-            await asyncio.sleep(1.0 * attempt)
+            logger.exception("Send failed attempt %s: %s", attempt, exc)
+            await asyncio.sleep(attempt)
 
     return False
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+
 def _extract_name(payload: dict) -> str | None:
-    candidates = [
-        payload.get("senderName"),
-        payload.get("contactName"),
-        payload.get("name"),
-        payload.get("profileName"),
-    ]
-    for value in candidates:
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:512]
+    for key in ["senderName", "contactName", "name", "profileName"]:
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:512]
     return None
-
-
-def _extract_external_ids(payload: dict) -> tuple[str, str]:
-    wati_conversation_id = str(payload.get("conversationId") or "").strip()
-    wati_message_id = str(
-        payload.get("whatsappMessageId") or payload.get("id") or ""
-    ).strip()
-    return wati_conversation_id, wati_message_id
 
 
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
@@ -127,14 +113,11 @@ def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
 
 
 # =========================================================
-# CONVERSATION LOGIC (FIXED)
+# CONVERSATION LOGIC 
 # =========================================================
-def _get_or_create_conversation(
-    db, senior: Senior, wati_conversation_id: str
-) -> Conversation:
-
+def _get_or_create_conversation(db, senior: Senior, wati_conversation_id: str):
     if wati_conversation_id:
-        conversation = (
+        conv = (
             db.query(Conversation)
             .filter(
                 Conversation.wati_conversation_id == wati_conversation_id,
@@ -142,10 +125,9 @@ def _get_or_create_conversation(
             )
             .first()
         )
-        if conversation:
-            return conversation
+        if conv:
+            return conv
 
-    # fallback latest
     latest = (
         db.query(Conversation)
         .filter(
@@ -156,23 +138,22 @@ def _get_or_create_conversation(
         .first()
     )
 
-    # create new if new WATI conversation OR none exists
     if not latest or wati_conversation_id:
-        conversation = Conversation(
+        conv = Conversation(
             senior_id=senior.id,
             wati_conversation_id=wati_conversation_id,
         )
-        db.add(conversation)
+        db.add(conv)
         db.flush()
-        return conversation
+        return conv
 
     return latest
 
 
 # =========================================================
-# THREAD LOGIC (FIXED)
+# THREAD LOGIC 
 # =========================================================
-def _get_or_create_thread(db, conversation: Conversation, now: datetime) -> Thread:
+def _get_or_create_thread(db, conversation: Conversation, now: datetime):
     last_thread = (
         db.query(Thread)
         .filter(Thread.conversation_id == conversation.id)
@@ -208,7 +189,7 @@ def _get_or_create_thread(db, conversation: Conversation, now: datetime) -> Thre
 
 
 # =========================================================
-# PERSIST MESSAGE
+# PERSIST INCOMING MESSAGE
 # =========================================================
 def _persist_incoming(phone: str, message: str, payload: dict) -> int:
     db = SessionLocal()
@@ -216,7 +197,12 @@ def _persist_incoming(phone: str, message: str, payload: dict) -> int:
 
     try:
         first_name = _extract_name(payload)
-        wati_conversation_id, wati_message_id = _extract_external_ids(payload)
+
+        
+        wati_conversation_id = str(payload.get("conversationId") or "").strip()
+        wati_message_id = str(
+            payload.get("whatsappMessageId") or payload.get("id") or ""
+        ).strip()
 
         template_value = str(payload.get("type") or "text").strip() or "text"
 
@@ -246,12 +232,11 @@ def _persist_incoming(phone: str, message: str, payload: dict) -> int:
         db.commit()
 
         logger.info(
-            "Saved message id=%s phone=%s conv=%s wati_conv=%s thread=%s",
+            "Saved message id=%s phone=%s conv=%s wati_conv=%s",
             message_id,
             phone,
             conversation.id,
             wati_conversation_id,
-            thread.id,
         )
 
         return message_id
@@ -273,12 +258,11 @@ def _update_bot_response(message_id: int, bot_response: str):
     try:
         msg = db.query(Message).filter(Message.id == message_id).first()
 
-        if not msg:
+        if msg:
+            msg.bot_response = bot_response
+            db.commit()
+        else:
             logger.warning("Message not found id=%s", message_id)
-            return
-
-        msg.bot_response = bot_response
-        db.commit()
 
     except Exception:
         db.rollback()
@@ -289,22 +273,26 @@ def _update_bot_response(message_id: int, bot_response: str):
 
 
 # =========================================================
-# MAIN FLOW
+# MAIN ENTRYPOINT
 # =========================================================
 async def process_incoming_message(
     phone: str, message: str, payload: dict | None = None
-) -> None:
+):
     if not phone:
         logger.warning("Skipping message: no phone")
         return
 
     try:
+        # 1. Save incoming message
         message_id = _persist_incoming(phone, message, payload or {})
 
+        # 2. Generate response (LLM handles everything)
         response = await generate_wati_reply(phone, message)
 
+        # 3. Save bot response
         _update_bot_response(message_id, response)
 
+        # 4. Send response
         sent = await send_message(phone, response)
 
         if not sent:
