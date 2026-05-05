@@ -398,7 +398,6 @@ def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
         user_type="senior",
         is_superuser=False,
         is_staff=False,
-        date_joined=datetime.now(UTC),
         is_active=True,
         is_deleted=False,
     )
