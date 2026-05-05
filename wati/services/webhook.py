@@ -398,8 +398,7 @@ def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
         user_type="senior",
         is_superuser=False,
         is_staff=False,
-        is_active=True,
-        is_deleted=False,
+    
     )
     db.add(user)
     db.flush()
