@@ -1,5 +1,5 @@
-from sqlalchemy import Column, String, Boolean
-
+from sqlalchemy import Column, String, Boolean,DateTime
+from datetime import datetime
 from sqlalchemy.orm import backref, relationship
 
 from app.models.base import BaseModel
@@ -22,6 +22,7 @@ class User(BaseModel):
     last_name = Column(String(255), nullable=True)
     is_superuser = Column(Boolean, default=False)
     is_staff = Column(Boolean, default=False)
+    date_joined = Column(DateTime, default=datetime.utcnow)
  
    
 
