@@ -42,6 +42,7 @@ class Senior(BaseModel):
     languages = relationship("Language", secondary=senior_language_association)
     relation = relationship("Relative", secondary=senior_relative_association, lazy="dynamic")
 
+
     def __str__(self):
         return f"{self.user.first_name} ({self.user.phone_number})"
 
@@ -53,12 +54,12 @@ class Language(BaseNamedEntity):
 class Relative(BaseModel):
     __tablename__ = "senior_relative"
 
-    relationship = Column("relationship", String(20), nullable=False)
+    relationship_name = Column("relationship", String(20), nullable=False)
     user_id = Column(Integer, ForeignKey("access_user.id", ondelete="CASCADE"), nullable=False)
-    user = relationship("User", backref=backref("relatives", lazy="dynamic"))
+    user = relationship("User",foreign_keys=[user_id],backref=backref("relatives", lazy="dynamic"))
 
     def __str__(self):
-        return f"{self.user.first_name} ({self.relationship})"
+        return f"{self.user.first_name} ({self.relationship_name})"
 
 
 class DeviceModel(BaseNamedEntity):

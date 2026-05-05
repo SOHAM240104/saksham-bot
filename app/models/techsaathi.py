@@ -4,15 +4,15 @@ from sqlalchemy.orm import relationship
 from app.models.base import Base, BaseModel
 
 tech_saathi_language_association = Table(
-    "senior_techsaathi_language",
+    "tech_saathi_techsaathi_language",
     Base.metadata,
-    Column("techsaathi_id", Integer, ForeignKey("senior_techsaathi.id", ondelete="CASCADE"), primary_key=True),
+    Column("techsaathi_id", Integer, ForeignKey("tech_saathi_techsaathi.id", ondelete="CASCADE"), primary_key=True),
     Column("language_id", Integer, ForeignKey("administration_language.id", ondelete="CASCADE"), primary_key=True),
 )
 
 
 class TechSaathi(BaseModel):
-    __tablename__ = "senior_techsaathi"
+    __tablename__ = "tech_saathi_techsaathi"
 
     user_id = Column(Integer, ForeignKey("access_user.id", ondelete="CASCADE"), nullable=False, unique=True)
     language = relationship("Language", secondary=tech_saathi_language_association, lazy="dynamic")
