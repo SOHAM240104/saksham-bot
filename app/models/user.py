@@ -1,5 +1,5 @@
-from sqlalchemy import Column, String, Boolean, DateTime, timezone
-from datetime import datetime
+from sqlalchemy import Column, String, Boolean
+
 from sqlalchemy.orm import backref, relationship
 
 from app.models.base import BaseModel
