@@ -19,6 +19,9 @@ class User(BaseModel):
     user_type = Column(USER_TYPE_ENUM, nullable=False, default="user")
     first_name = Column(String(255), nullable=True)
     last_name = Column(String(255), nullable=True)
+    is_superuser = Column(Boolean, default=False)
+    is_staff = Column(Boolean, default=False)
+
 
     senior_profile = relationship(
     "Senior",
