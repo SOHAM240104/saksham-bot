@@ -1,10 +1,13 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import quote
 
 import httpx
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from sqlalchemy import desc
 
 from app.config.base import SessionLocal
@@ -12,6 +15,7 @@ from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
 from app.models.user import User
 from wati.services.conversation import (
+    _build_history_messages,
     _looks_like_troubleshooting_steps,
     classify_wati_turn_intent,
     conversation_control,
@@ -20,6 +24,50 @@ from wati.services.conversation import (
 from wati.settings import settings
 
 logger = logging.getLogger("wati.services.webhook")
+COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
+
+
+def _dynamic_copy(kind: str) -> str:
+    prompt = (
+        "Write one short WhatsApp support message in warm natural English.\n"
+        "No emojis. No bullets. One sentence only."
+    )
+    goals = {
+        "handoff_wait": "Tell user we are connecting to a human support agent and ask them to wait.",
+        "handoff_confirm": "Ask user if they want to connect to a human agent now; ask to reply Yes or No.",
+        "resolved_ack": "Acknowledge that issue is resolved in a warm way.",
+        "resolved_next": "Ask what else the assistant can help with in a friendly way.",
+    }
+    fallback = {
+        "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
+        "handoff_confirm": "Would you like me to connect you to a human agent now? Please reply Yes or No.",
+        "resolved_ack": "Happy to know this helped.",
+        "resolved_next": "What else can I help you with today?",
+    }
+    try:
+        r = COPY_LLM.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=goals.get(kind, "")),
+            ]
+        )
+        txt = (getattr(r, "content", "") or "").strip()
+        if txt:
+            return txt
+    except Exception:
+        logger.exception("Dynamic copy generation failed kind=%s", kind)
+    return fallback.get(kind, "How can I help you?")
+
+
+def _handoff_confirm_decision(text: str) -> str:
+    msg = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    yes_tokens = {"yes", "y", "haan", "ha", "ok", "okay", "sure", "connect", "transfer"}
+    no_tokens = {"no", "n", "nah", "nope", "not now", "dont", "don't", "later"}
+    if any(tok in msg for tok in yes_tokens):
+        return "YES"
+    if any(tok in msg for tok in no_tokens):
+        return "NO"
+    return "UNCLEAR"
 
 
 def wati_payload_indicates_human_operator(payload: dict | None) -> bool:
@@ -750,37 +798,6 @@ def _default_button_message(action: str) -> str:
     return "Please choose an option."
 
 
-def _post_steps_unresolved_count(
-    db, thread_id: int, current_message_id: int, current_turn_unresolved: bool
-) -> tuple[bool, int]:
-    msgs = (
-        db.query(Message)
-        .filter(
-            Message.thread_id == thread_id,
-            Message.is_deleted.is_(False),
-            Message.id != current_message_id,
-        )
-        .order_by(Message.created.asc())
-        .all()
-    )
-    post_steps_started = False
-    unresolved_count = 0
-    for msg in msgs:
-        bot_text = (msg.bot_response or "").strip()
-        lowered = bot_text.lower()
-        if _looks_like_troubleshooting_steps(bot_text) or "did this help" in lowered or "did this solve" in lowered:
-            post_steps_started = True
-        if not post_steps_started:
-            continue
-        user_text = (msg.user_message or "").strip().lower()
-        if user_text in {"still stuck", "still stuck ", "not resolved", "not_resolved"}:
-            unresolved_count += 1
-
-    if post_steps_started and current_turn_unresolved:
-        unresolved_count += 1
-    return post_steps_started, unresolved_count
-
-
 def append_human_operator_text_to_latest_message(
     phone: str, text: str, payload: dict
 ) -> None:
@@ -889,12 +906,26 @@ async def process_incoming_message(
 
         intent_result = {}
         classified_intent = ""
-        classifier_next_action = ""
-        classifier_confidence = None
-        post_steps_stage = False
-        unresolved_rounds = 0
+        step_rounds = 0
+        recent_step_hits = 0
+        history_for_llm: list[dict] | None = None
+        awaiting_handoff_confirm = False
+        confirm_reply = ""
+        ask_handoff_confirmation = False
 
-        should_run_classifier = True
+        db = SessionLocal()
+        try:
+            history_for_llm = _build_history_messages(
+                db, thread_id, message_id, incoming_message
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        should_run_classifier = bool(incoming_message.strip()) and not bool(button_reply_id)
         if should_run_classifier:
             db = SessionLocal()
             try:
@@ -905,6 +936,7 @@ async def process_incoming_message(
                     current_message=incoming_message,
                     payload=payload,
                     button_reply_id=button_reply_id,
+                    history=history_for_llm,
                 )
                 db.commit()
             except Exception:
@@ -914,29 +946,55 @@ async def process_incoming_message(
                 db.close()
 
             classified_intent = (intent_result.get("intent") or "").strip().upper()
-            classifier_next_action = (intent_result.get("next_action") or "").strip().upper()
-            classifier_confidence = intent_result.get("confidence")
-            if not isinstance(classifier_confidence, (int, float)):
-                classifier_confidence = None
             logger.info(
-                "LLM_INTENT intent=%s next_action=%s confidence=%s phone=%s",
+                "LLM_INTENT intent=%s phone=%s",
                 classified_intent,
-                classifier_next_action,
-                classifier_confidence,
                 phone,
             )
-        unresolved_signal_current_turn = (
-            button_reply_id == "not_resolved" or classified_intent == "NOT_RESOLVED"
-        )
+        db = SessionLocal()
+        try:
+            last_msg = (
+                db.query(Message)
+                .filter(
+                    Message.thread_id == thread_id,
+                    Message.is_deleted.is_(False),
+                    Message.id != message_id,
+                )
+                .order_by(desc(Message.created))
+                .first()
+            )
+            awaiting_handoff_confirm = bool(
+                last_msg and (last_msg.message_source or "").strip() == "handoff_confirmation"
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        if awaiting_handoff_confirm:
+            confirm_reply = _handoff_confirm_decision(incoming_message)
+        is_unresolved = button_reply_id == "not_resolved"
 
         db = SessionLocal()
         try:
-            post_steps_stage, unresolved_rounds = _post_steps_unresolved_count(
-                db,
-                thread_id=thread_id,
-                current_message_id=message_id,
-                current_turn_unresolved=unresolved_signal_current_turn,
+            msgs = (
+                db.query(Message)
+                .filter(
+                    Message.thread_id == thread_id,
+                    Message.is_deleted.is_(False),
+                    Message.id != message_id,
+                )
+                .order_by(desc(Message.created))
+                .limit(20)
+                .all()
             )
+            for msg in msgs[:3]:
+                if _looks_like_troubleshooting_steps((msg.bot_response or "").strip()):
+                    recent_step_hits += 1
+            for msg in reversed(msgs):
+                if _looks_like_troubleshooting_steps((msg.bot_response or "").strip()):
+                    step_rounds += 1
             db.commit()
         except Exception:
             db.rollback()
@@ -950,7 +1008,7 @@ async def process_incoming_message(
                 "kind": "control",
                 "action": (control_result.get("action") or "").strip(),
                 "message_source": "intent_classifier",
-                "confidence_score": classifier_confidence,
+                "confidence_score": None,
             }
 
         # --- Human ticket resolved (WATI UI) ---
@@ -1063,11 +1121,12 @@ async def process_incoming_message(
                 return
 
             if thread_row and thread_row.role == "chatbot" and thread_row.status == "assigned":
-                classifier_requested_handoff = (
-                    classified_intent == "REQUEST_HUMAN"
-                    and classifier_next_action == "ESCALATE_TO_HUMAN"
-                )
-                if classifier_requested_handoff and not switched_from_human_to_chatbot_this_turn:
+                classifier_requested_handoff = classified_intent == "REQUEST_HUMAN"
+                if (
+                    awaiting_handoff_confirm
+                    and confirm_reply == "YES"
+                    and not switched_from_human_to_chatbot_this_turn
+                ):
                     hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
                         db, thread_id
                     )
@@ -1076,7 +1135,12 @@ async def process_incoming_message(
                         thread_id = hid
                     handoff_needed = True
                     handoff_count = 1
-                elif post_steps_stage and unresolved_rounds >= 2:
+                elif (
+                    classifier_requested_handoff
+                    and not switched_from_human_to_chatbot_this_turn
+                ):
+                    ask_handoff_confirmation = True
+                elif is_unresolved and step_rounds >= 3:
                     hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
                         db, thread_id
                     )
@@ -1084,12 +1148,12 @@ async def process_incoming_message(
                         _reassign_message_thread(db, message_id, hid)
                         thread_id = hid
                     handoff_needed = True
-                    handoff_count = unresolved_rounds
+                    handoff_count = step_rounds
                     logger.info(
-                        "handoff_by_unresolved_threshold thread_id=%s phone=%s unresolved_rounds=%s",
+                        "handoff_by_step_rounds thread_id=%s phone=%s step_rounds=%s",
                         thread_id,
                         phone,
-                        unresolved_rounds,
+                        step_rounds,
                     )
             db.commit()
         except Exception:
@@ -1097,6 +1161,17 @@ async def process_incoming_message(
             raise
         finally:
             db.close()
+
+        if awaiting_handoff_confirm and confirm_reply == "UNCLEAR":
+            confirm_text = _dynamic_copy("handoff_confirm")
+            await send_message(phone, confirm_text)
+            _update_bot_response(
+                message_id,
+                bot_response=confirm_text,
+                message_source="handoff_confirmation",
+                confidence_score=None,
+            )
+            return
 
         if handoff_needed:
             teams = ["support"]
@@ -1120,9 +1195,9 @@ async def process_incoming_message(
             if tenant and not base.rstrip("/").endswith(tenant):
                 assign_operator_url = f"{base}/{tenant}/api/v1/assignOperator"
 
-            if teams:
-                try:
-                    async with httpx.AsyncClient(timeout=20.0) as client:
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    if teams:
                         r = await client.post(
                             assign_team_url,
                             headers=headers,
@@ -1135,12 +1210,7 @@ async def process_incoming_message(
                             r.text,
                             assign_team_url,
                         )
-                except Exception:
-                    logger.exception("WATI assignTeam request failed")
-
-            if assignee_email and phone:
-                try:
-                    async with httpx.AsyncClient(timeout=20.0) as client:
+                    if assignee_email and phone:
                         r = await client.post(
                             assign_operator_url,
                             headers=headers,
@@ -1152,12 +1222,7 @@ async def process_incoming_message(
                             r.text,
                             assign_operator_url,
                         )
-                except Exception:
-                    logger.exception("WATI assignOperator request failed")
-
-            if channel_number and phone:
-                try:
-                    async with httpx.AsyncClient(timeout=20.0) as client:
+                    if channel_number and phone:
                         r = await client.post(
                             f"{base}/api/v1/updateChatStatus",
                             headers=headers,
@@ -1172,16 +1237,10 @@ async def process_incoming_message(
                             r.status_code,
                             r.text,
                         )
-                except Exception:
-                    logger.exception("WATI updateChatStatus request failed")
+            except Exception:
+                logger.exception("WATI handoff request failed")
 
-            if teams or assignee_email:
-                wait_text = (
-                    "I'm connecting you to a human expert. "
-                    "Your ticket is open and the chat is being assigned to support—please wait for an agent."
-                )
-            else:
-                wait_text = "I'm connecting you to a human expert. Please wait."
+            wait_text = _dynamic_copy("handoff_wait")
             await send_message(phone, wait_text)
             logger.info(
                 "handoff_triggered thread_id=%s phone=%s signal_count=%s",
@@ -1196,17 +1255,16 @@ async def process_incoming_message(
             )
             return
 
-        if classified_intent == "REQUEST_HUMAN" and classifier_next_action != "ESCALATE_TO_HUMAN":
-            confirm_text = (
-                "Sure — do you want me to connect you to a human agent now? "
-                "Please reply with Yes or No."
-            )
+        if ask_handoff_confirmation or (
+            classified_intent == "REQUEST_HUMAN" and not awaiting_handoff_confirm
+        ):
+            confirm_text = _dynamic_copy("handoff_confirm")
             await send_message(phone, confirm_text)
             _update_bot_response(
                 message_id,
                 bot_response=confirm_text,
                 message_source="handoff_confirmation",
-                confidence_score=classifier_confidence,
+                confidence_score=None,
             )
             return
 
@@ -1223,9 +1281,20 @@ async def process_incoming_message(
         # 3. Generate response from history + tool calling
         db = SessionLocal()
         try:
+            turn_meta={
+                "button_reply_id": button_reply_id or "",
+                "unresolved_signal_current_turn": is_unresolved,
+                "unresolved_rounds": step_rounds,
+            }
             llm_result = override or await generate_wati_reply(
-                db, thread_id, message_id, incoming_message
+                db,
+                thread_id,
+                message_id,
+                incoming_message,
+                turn_meta=turn_meta,
+                history=history_for_llm,
             )
+
             db.commit()
         except Exception:
             db.rollback()
@@ -1253,14 +1322,16 @@ async def process_incoming_message(
                 finally:
                     db.close()
 
-                sent_ack = await send_message(phone, "Glad it's working now 😊")
+                ack_text = _dynamic_copy("resolved_ack")
+                next_text = _dynamic_copy("resolved_next")
+                sent_ack = await send_message(phone, ack_text)
                 sent_mode = await send_interactive_buttons_message(
                     phone,
-                    "Anything else I can help you with?",
+                    next_text,
                     "mode_buttons",
                 )
                 sent = sent_ack and sent_mode
-                bot_response = "Glad it's working now 😊\nAnything else I can help you with?"
+                bot_response = f"{ack_text}\n{next_text}"
                 if not response_source:
                     response_source = "conversation_control"
             else:
