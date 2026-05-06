@@ -135,21 +135,25 @@ async def classify_wati_turn_intent(
     history: list[dict] | None = None,
 ) -> dict:
     """
-    Minimal LLM intent classifier.
-    Returns: {"intent": "..."}
+    LLM turn-state classifier used by webhook policy gates.
+    Returns normalized semantic signals plus intent.
     """
     history = history or _build_history_messages(db, thread_id, current_message_id, current_message)
-    user_lines = [h.get("content", "") for h in history if h.get("role") == "user" and h.get("content")]
-    history_window = user_lines[-3:]
+    history_window = history[-12:]
     payload = payload or {}
 
     classifier_system = (
-        "Classify latest user text for WhatsApp support.\n"
-        "Return JSON only with key: intent.\n"
+        f"{_load_system_prompt()}\n\n"
+        "<classification_task>\n"
+        "Based on the system policy above, classify latest turn state.\n"
+        "Return JSON only with keys:\n"
+        "intent, same_issue_as_previous, is_unresolved_followup, issue_signature, "
+        "issue_followup_depth, handoff_recommended.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
-        "REQUEST_HUMAN when user asks to talk to human/agent/support person.\n"
-        "RESOLVED when user says issue is fixed/resolved/working.\n"
-        "Otherwise OTHER."
+        "issue_signature must be short snake_case.\n"
+        "issue_followup_depth must be integer >= 1.\n"
+        "No prose, no markdown.\n"
+        "</classification_task>"
     )
     classifier_input = {
         "latest_user_message": (current_message or "").strip(),
@@ -175,7 +179,31 @@ async def classify_wati_turn_intent(
     allowed_intents = {"REQUEST_HUMAN", "RESOLVED", "OTHER"}
     if intent not in allowed_intents:
         intent = "OTHER"
-    return {"intent": intent}
+    same_issue = bool(parsed.get("same_issue_as_previous"))
+    unresolved_followup = bool(parsed.get("is_unresolved_followup"))
+    issue_signature = re.sub(
+        r"[^a-z0-9_]+",
+        "_",
+        str(parsed.get("issue_signature") or "").strip().lower(),
+    ).strip("_")
+    if not issue_signature:
+        issue_signature = "general_issue"
+    depth_raw = parsed.get("issue_followup_depth")
+    try:
+        issue_followup_depth = int(depth_raw)
+    except Exception:
+        issue_followup_depth = 1
+    if issue_followup_depth < 1:
+        issue_followup_depth = 1
+    handoff_recommended = bool(parsed.get("handoff_recommended"))
+    return {
+        "intent": intent,
+        "same_issue_as_previous": same_issue,
+        "is_unresolved_followup": unresolved_followup,
+        "issue_signature": issue_signature,
+        "issue_followup_depth": issue_followup_depth,
+        "handoff_recommended": handoff_recommended,
+    }
 
 
 def _user_chose_tech_support(text: str) -> bool:
@@ -322,18 +350,6 @@ def _name_for_thread(db, thread_id: int) -> str:
     return (user.first_name or "").strip() if user else ""
 
 
-def _with_name(text: str, name: str) -> str:
-    msg = (text or "").strip()
-    nm = (name or "").strip()
-    if not msg or not nm:
-        return msg
-    low = msg.lower()
-    tag = f"{nm.lower()} ji"
-    if tag in low or nm.lower() in low:
-        return msg
-    return f"{nm} ji, {msg}"
-
-
 def _infer_runtime_context(history: list[dict]) -> dict:
     # Platform: most recent user message that mentions a supported device (scan newest first).
     known_platform = ""
@@ -366,22 +382,10 @@ def _infer_runtime_context(history: list[dict]) -> dict:
         if known_os_version and known_model:
             break
 
-    # Issue: newest substantive user line (do not keyword-filter greetings here; LLM handles ambiguity).
-    latest_issue = ""
-    for item in reversed(history):
-        if item.get("role") != "user":
-            continue
-        content = (item.get("content") or "").strip()
-        if not content:
-            continue
-        latest_issue = content
-        break
-
     return {
         "known_platform": known_platform,
         "known_os_version": known_os_version,
         "known_model": known_model,
-        "latest_issue": latest_issue,
     }
 
 
@@ -411,9 +415,8 @@ async def generate_wati_reply(
         if slug in SUPPORTED_PLATFORMS:
             return {
                 "kind": "text",
-                "message": _with_name(_issue_prompt_for_platform(slug), customer_name),
+                "message": _issue_prompt_for_platform(slug),
                 "message_source": "",
-                "confidence_score": None,
             }
 
     messages = _to_langchain_messages(history)
@@ -426,22 +429,19 @@ async def generate_wati_reply(
                 f"known_platform: {runtime_context.get('known_platform') or 'unknown'}\n"
                 f"known_os_version: {runtime_context.get('known_os_version') or 'unknown'}\n"
                 f"known_model: {runtime_context.get('known_model') or 'unknown'}\n"
-                f"latest_issue: {runtime_context.get('latest_issue') or 'unknown'}\n"
                 f"customer_name: {customer_name or 'unknown'}\n"
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
-                "If customer_name is present, greet/address the user naturally as '<customer_name> ji' where appropriate.\n"
                 "When unresolved_signal_current_turn is true: follow system prompt PRECEDENCE and RULE 5 — "
                 "one diagnostic question only this turn; do not call search_support_docs or send_feedback_buttons "
-                "unless latest_issue already contains concrete new failure detail.\n"
+                "unless the latest user message already contains concrete new failure detail.\n"
                 "Decide follow-up dynamically from the latest user message and context.\n"
                 "If issue is clear and not blocked by PRECEDENCE, call search_support_docs immediately.\n"
                 "If issue is unclear or user says still stuck (and PRECEDENCE applies), ask exactly one short follow-up question.\n"
-                "Do not provide troubleshooting steps while asking follow-up.\n"
-                "Do not provide lists/options in follow-up questions.\n"
-                "OS/model are optional refinements; never block on missing OS/model.\n"
-                "Do not repeat the same follow-up wording.\n"
+                "On unresolved follow-up turns, ask one missing platform-specific refinement before the next search_support_docs call (Apple/Pixel/Xiaomi/Oppo: OS version; Samsung: model).\n"
+                "If latest user message contains an unsupported phone brand, respond in plain text with supported brands and one continuation question; do not call send_platform_buttons.\n"
+                "After asking that one refinement question, wait for user reply before retrieval.\n"
                 "</runtime_context>"
             )
         ),
@@ -460,13 +460,13 @@ async def generate_wati_reply(
                 return {
                     "kind": "action",
                     "action": "feedback_buttons",
-                    "message": _with_name(text, customer_name),
+                    "message": text,
                     "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                     "confidence_score": retrieval_confidence,
                 }
             return {
                 "kind": "text",
-                "message": _with_name(text, customer_name),
+                "message": text,
                 "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                 "confidence_score": retrieval_confidence,
             }
@@ -537,30 +537,43 @@ async def generate_wati_reply(
                 return {
                     "kind": "action",
                     "action": "mode_buttons",
-                    "message": _with_name((args.get("message") or "").strip(), customer_name),
+                    "message": (args.get("message") or "").strip(),
                     "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
-                    "confidence_score": retrieval_confidence,
                 }
 
             if tool_name == "send_platform_buttons":
                 msg = (args.get("message") or "").strip()
+                known_platform = (runtime_context.get("known_platform") or "").strip().lower()
+                if known_platform in SUPPORTED_PLATFORMS:
+                    return {
+                        "kind": "text",
+                        "message": msg,
+                        "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                    }
                 return {
                     "kind": "action",
                     "action": "platform_buttons",
-                    "message": _with_name(msg, customer_name),
+                    "message": msg,
                     "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
-                    "confidence_score": retrieval_confidence,
                 }
 
             if tool_name == "send_feedback_buttons":
                 msg = (args.get("message") or "").strip()
-                return {
+                if not _looks_like_troubleshooting_steps(msg):
+                    return {
+                        "kind": "text",
+                        "message": msg,
+                        "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                    }
+                result = {
                     "kind": "action",
                     "action": "feedback_buttons",
-                    "message": _with_name(msg, customer_name),
+                    "message": msg,
                     "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
-                    "confidence_score": retrieval_confidence,
                 }
+                if had_search_support_this_turn:
+                    result["confidence_score"] = retrieval_confidence
+                return result
 
             if tool_name == "conversation_control":
                 return {"kind": "control", "action": (args.get("action") or "").strip()}
@@ -573,20 +586,18 @@ async def generate_wati_reply(
             return {
                 "kind": "action",
                 "action": "feedback_buttons",
-                "message": _with_name(text, customer_name),
+                "message": text,
                 "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                 "confidence_score": retrieval_confidence,
             }
         return {
             "kind": "text",
-            "message": _with_name(text, customer_name),
+            "message": text,
             "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
-            "confidence_score": retrieval_confidence,
         }
 
     return {
         "kind": "text",
-        "message": _with_name("Could you share a little more detail about the issue?", customer_name),
+        "message": "Could you share a little more detail about the issue?",
         "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
-        "confidence_score": retrieval_confidence,
     }
