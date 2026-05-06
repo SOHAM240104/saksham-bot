@@ -911,6 +911,7 @@ async def process_incoming_message(
         history_for_llm: list[dict] | None = None
         awaiting_handoff_confirm = False
         confirm_reply = ""
+        declined_handoff = False
         ask_handoff_confirmation = False
 
         db = SessionLocal()
@@ -974,6 +975,7 @@ async def process_incoming_message(
             db.close()
         if awaiting_handoff_confirm:
             confirm_reply = _handoff_confirm_decision(incoming_message)
+            declined_handoff = confirm_reply == "NO"
         is_unresolved = button_reply_id == "not_resolved"
 
         db = SessionLocal()
@@ -1121,7 +1123,9 @@ async def process_incoming_message(
                 return
 
             if thread_row and thread_row.role == "chatbot" and thread_row.status == "assigned":
-                classifier_requested_handoff = classified_intent == "REQUEST_HUMAN"
+                classifier_requested_handoff = (
+                    classified_intent == "REQUEST_HUMAN" and not declined_handoff
+                )
                 if (
                     awaiting_handoff_confirm
                     and confirm_reply == "YES"
@@ -1256,7 +1260,9 @@ async def process_incoming_message(
             return
 
         if ask_handoff_confirmation or (
-            classified_intent == "REQUEST_HUMAN" and not awaiting_handoff_confirm
+            classified_intent == "REQUEST_HUMAN"
+            and not awaiting_handoff_confirm
+            and not declined_handoff
         ):
             confirm_text = _dynamic_copy("handoff_confirm")
             await send_message(phone, confirm_text)
