@@ -135,21 +135,25 @@ async def classify_wati_turn_intent(
     history: list[dict] | None = None,
 ) -> dict:
     """
-    Minimal LLM intent classifier.
-    Returns: {"intent": "..."}
+    LLM turn-state classifier used by webhook policy gates.
+    Returns normalized semantic signals plus intent.
     """
     history = history or _build_history_messages(db, thread_id, current_message_id, current_message)
-    user_lines = [h.get("content", "") for h in history if h.get("role") == "user" and h.get("content")]
-    history_window = user_lines[-3:]
+    history_window = history[-12:]
     payload = payload or {}
 
     classifier_system = (
-        "Classify latest user text for WhatsApp support.\n"
-        "Return JSON only with key: intent.\n"
+        f"{_load_system_prompt()}\n\n"
+        "<classification_task>\n"
+        "Based on the system policy above, classify latest turn state.\n"
+        "Return JSON only with keys:\n"
+        "intent, same_issue_as_previous, is_unresolved_followup, issue_signature, "
+        "issue_followup_depth, handoff_recommended.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
-        "REQUEST_HUMAN when user asks to talk to human/agent/support person.\n"
-        "RESOLVED when user says issue is fixed/resolved/working.\n"
-        "Otherwise OTHER."
+        "issue_signature must be short snake_case.\n"
+        "issue_followup_depth must be integer >= 1.\n"
+        "No prose, no markdown.\n"
+        "</classification_task>"
     )
     classifier_input = {
         "latest_user_message": (current_message or "").strip(),
@@ -175,7 +179,31 @@ async def classify_wati_turn_intent(
     allowed_intents = {"REQUEST_HUMAN", "RESOLVED", "OTHER"}
     if intent not in allowed_intents:
         intent = "OTHER"
-    return {"intent": intent}
+    same_issue = bool(parsed.get("same_issue_as_previous"))
+    unresolved_followup = bool(parsed.get("is_unresolved_followup"))
+    issue_signature = re.sub(
+        r"[^a-z0-9_]+",
+        "_",
+        str(parsed.get("issue_signature") or "").strip().lower(),
+    ).strip("_")
+    if not issue_signature:
+        issue_signature = "general_issue"
+    depth_raw = parsed.get("issue_followup_depth")
+    try:
+        issue_followup_depth = int(depth_raw)
+    except Exception:
+        issue_followup_depth = 1
+    if issue_followup_depth < 1:
+        issue_followup_depth = 1
+    handoff_recommended = bool(parsed.get("handoff_recommended"))
+    return {
+        "intent": intent,
+        "same_issue_as_previous": same_issue,
+        "is_unresolved_followup": unresolved_followup,
+        "issue_signature": issue_signature,
+        "issue_followup_depth": issue_followup_depth,
+        "handoff_recommended": handoff_recommended,
+    }
 
 
 def _user_chose_tech_support(text: str) -> bool:

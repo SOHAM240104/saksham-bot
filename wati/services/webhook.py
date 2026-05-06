@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -16,7 +17,6 @@ from app.models.senior import Senior
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
-    _looks_like_troubleshooting_steps,
     classify_wati_turn_intent,
     conversation_control,
     generate_wati_reply,
@@ -27,22 +27,45 @@ logger = logging.getLogger("wati.services.webhook")
 COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
 
 
-def _dynamic_copy(kind: str) -> str:
-    prompt = (
-        "Write one short WhatsApp support message in warm natural English.\n"
-        "No emojis. No bullets. One sentence only."
+def _load_dynamic_copy_prompt() -> str:
+    fallback = (
+        "You are generating outbound WhatsApp support copy.\n"
+        "Return exactly ONE sentence, plain text only.\n"
+        "No emojis. No bullets. No markdown.\n"
+        "Tone: warm, calm, human.\n"
+        "Keep it concise."
     )
+    try:
+        path = Path(__file__).resolve().parents[1] / "llm" / "systemprompt.txt"
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return fallback
+    m = re.search(
+        r"<dynamic_copy_prompt>\s*(.*?)\s*</dynamic_copy_prompt>",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return fallback
+    extracted = (m.group(1) or "").strip()
+    return extracted or fallback
+
+
+def _dynamic_copy(kind: str) -> str:
+    prompt = _load_dynamic_copy_prompt()
     goals = {
         "handoff_wait": "Tell user we are connecting to a human support agent and ask them to wait.",
         "handoff_confirm": "Ask user if they want to connect to a human agent now; ask to reply Yes or No.",
         "resolved_ack": "Acknowledge that issue is resolved in a warm way.",
         "resolved_next": "Ask what else the assistant can help with in a friendly way.",
+        "feedback_checkin": "Write a natural one-line follow-up check-in after troubleshooting steps. Avoid 'Did this help?'.",
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
         "handoff_confirm": "Would you like me to connect you to a human agent now? Please reply Yes or No.",
         "resolved_ack": "Happy to know this helped.",
         "resolved_next": "What else can I help you with today?",
+        "feedback_checkin": "Please try this once and tell me what you see now.",
     }
     try:
         r = COPY_LLM.invoke(
@@ -797,7 +820,7 @@ def _default_button_message(action: str) -> str:
     if action == "platform_buttons":
         return "Which phone are you using?"
     if action == "feedback_buttons":
-        return "Did this solve the issue?"
+        return _dynamic_copy("feedback_checkin")
     return "Please choose an option."
 
 
@@ -912,7 +935,9 @@ async def process_incoming_message(
 
         intent_result = {}
         classified_intent = ""
-        step_rounds = 0
+        issue_followup_depth = 1
+        same_issue_as_previous = False
+        is_unresolved_followup = False
         history_for_llm: list[dict] | None = None
         awaiting_handoff_confirm = False
         confirm_reply = ""
@@ -931,7 +956,7 @@ async def process_incoming_message(
         finally:
             db.close()
 
-        should_run_classifier = bool(incoming_message.strip()) and not bool(button_reply_id)
+        should_run_classifier = bool(incoming_message.strip()) or bool(button_reply_id)
         if should_run_classifier:
             db = SessionLocal()
             try:
@@ -952,11 +977,26 @@ async def process_incoming_message(
                 db.close()
 
             classified_intent = (intent_result.get("intent") or "").strip().upper()
+            same_issue_as_previous = bool(intent_result.get("same_issue_as_previous"))
+            is_unresolved_followup = bool(intent_result.get("is_unresolved_followup"))
+            raw_depth = intent_result.get("issue_followup_depth")
+            issue_followup_depth = raw_depth if isinstance(raw_depth, int) else 1
+            if issue_followup_depth < 1:
+                issue_followup_depth = 1
             logger.info(
-                "LLM_INTENT intent=%s phone=%s",
+                "LLM_INTENT intent=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
                 classified_intent,
                 phone,
+                same_issue_as_previous,
+                is_unresolved_followup,
+                issue_followup_depth,
             )
+        # Deterministic signal for unresolved button taps.
+        # Button input is an explicit unresolved follow-up on current issue.
+        if button_reply_id == "not_resolved":
+            is_unresolved_followup = True
+            same_issue_as_previous = True
+            issue_followup_depth = max(issue_followup_depth, 2)
         db = SessionLocal()
         try:
             last_msg = (
@@ -981,30 +1021,7 @@ async def process_incoming_message(
         if awaiting_handoff_confirm:
             confirm_reply = _handoff_confirm_decision(incoming_message)
             declined_handoff = confirm_reply == "NO"
-        is_unresolved = button_reply_id == "not_resolved"
-
-        db = SessionLocal()
-        try:
-            msgs = (
-                db.query(Message)
-                .filter(
-                    Message.thread_id == thread_id,
-                    Message.is_deleted.is_(False),
-                    Message.id != message_id,
-                )
-                .order_by(desc(Message.created))
-                .limit(20)
-                .all()
-            )
-            for msg in reversed(msgs):
-                if _looks_like_troubleshooting_steps((msg.bot_response or "").strip()):
-                    step_rounds += 1
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
 
         if classified_intent == "RESOLVED":
             control_result = conversation_control.invoke({"action": "resolved"})
@@ -1146,7 +1163,11 @@ async def process_incoming_message(
                     and not switched_from_human_to_chatbot_this_turn
                 ):
                     ask_handoff_confirmation = True
-                elif is_unresolved and step_rounds >= 3:
+                elif (
+                    same_issue_as_previous
+                    and is_unresolved
+                    and issue_followup_depth >= 4
+                ):
                     hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
                         db, thread_id
                     )
@@ -1154,12 +1175,12 @@ async def process_incoming_message(
                         _reassign_message_thread(db, message_id, hid)
                         thread_id = hid
                     handoff_needed = True
-                    handoff_count = step_rounds
+                    handoff_count = issue_followup_depth
                     logger.info(
-                        "handoff_by_step_rounds thread_id=%s phone=%s step_rounds=%s",
+                        "handoff_by_issue_followup_depth thread_id=%s phone=%s issue_followup_depth=%s",
                         thread_id,
                         phone,
-                        step_rounds,
+                        issue_followup_depth,
                     )
             db.commit()
         except Exception:
@@ -1292,7 +1313,7 @@ async def process_incoming_message(
             turn_meta={
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
-                "unresolved_rounds": step_rounds,
+                "unresolved_rounds": issue_followup_depth,
             }
             llm_result = override or await generate_wati_reply(
                 db,
