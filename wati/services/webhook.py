@@ -436,12 +436,15 @@ def _extract_name(payload: dict) -> str | None:
 
 
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
-    user = db.query(User).filter(User.phone_number == phone).first()
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    p_91 = digits
+    p_plus = f"+{digits}" if digits else ""
+    user = db.query(User).filter(User.phone_number.in_([p_plus, p_91])).first()
     if user:
         return user
 
     user = User(
-        phone_number=phone,
+        phone_number=p_plus or phone,
         first_name=first_name,
         user_type="senior",
         is_superuser=False,
@@ -806,7 +809,10 @@ def append_human_operator_text_to_latest_message(
         return
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.phone_number == phone).first()
+        digits = "".join(c for c in str(phone or "") if c.isdigit())
+        p_91 = digits
+        p_plus = f"+{digits}" if digits else ""
+        user = db.query(User).filter(User.phone_number.in_([p_plus, p_91])).first()
         senior = user.senior_profile if user else None
         if not senior:
             return
@@ -907,7 +913,6 @@ async def process_incoming_message(
         intent_result = {}
         classified_intent = ""
         step_rounds = 0
-        recent_step_hits = 0
         history_for_llm: list[dict] | None = None
         awaiting_handoff_confirm = False
         confirm_reply = ""
@@ -991,9 +996,6 @@ async def process_incoming_message(
                 .limit(20)
                 .all()
             )
-            for msg in msgs[:3]:
-                if _looks_like_troubleshooting_steps((msg.bot_response or "").strip()):
-                    recent_step_hits += 1
             for msg in reversed(msgs):
                 if _looks_like_troubleshooting_steps((msg.bot_response or "").strip()):
                     step_rounds += 1

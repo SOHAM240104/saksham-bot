@@ -1,12 +1,8 @@
 import time
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 
 from app.settings import TECH_VECTOR_COLLECTION
 from app.vectorstore import get_vector_store
-
-MODEL_NAME = "gpt-4.1-mini"
-
 
 def retrieve_support_docs(
     user_query,
@@ -98,36 +94,3 @@ def search_support_docs(user_query: str, platform: str, os_version: str = "", re
         "sources": sources,
         "confidence_score": avg_confidence,
     }
-
-
-def stream_rag_response(user_query, context, device=None, name="User", os_version=None):
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0)
-    prompt = f"""
-You are a smartphone support assistant.
-Provide concise, practical troubleshooting guidance based on the given documentation context.
-
-<runtime_context>
-Name: {name}
-Device: {(device or "unknown").upper()}
-OS Version: {os_version or "unknown"}
-</runtime_context>
-
-<knowledge_context>
-{context}
-</knowledge_context>
-
-<user_query>
-{user_query}
-</user_query>
-"""
-
-    start = time.time()
-    first_token_time = None
-    for chunk in llm.stream(prompt):
-        content = getattr(chunk, "content", "")
-        if content:
-            if first_token_time is None:
-                first_token_time = time.time()
-                print(f"[TIMING] FIRST TOKEN: {first_token_time - start:.3f}s")
-            yield content
-    print(f"[TIMING] FULL RESPONSE: {time.time() - start:.3f}s")
