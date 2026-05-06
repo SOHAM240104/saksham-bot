@@ -149,6 +149,7 @@ async def classify_wati_turn_intent(
         "Return JSON only with keys:\n"
         "intent, same_issue_as_previous, is_unresolved_followup, issue_signature, "
         "issue_followup_depth, handoff_recommended.\n"
+        "Treat short unresolved-negative continuations like 'still stuck', 'not resolved', 'same issue', 'not working', 'didn't work', 'can't figure it out', 'can't do it' (without new technical detail) as is_unresolved_followup=true and same_issue_as_previous=true.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
         "issue_signature must be short snake_case.\n"
         "issue_followup_depth must be integer >= 1.\n"
@@ -336,6 +337,45 @@ def _looks_like_troubleshooting_steps(text: str) -> bool:
     return False
 
 
+def _is_unresolved_negative_short_reply(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized or len(normalized) > 64:
+        return False
+    phrases = (
+        "still stuck",
+        "not working",
+        "same issue",
+        "not resolved",
+        "didnt work",
+        "didn t work",
+        "cant figure it out",
+        "can t figure it out",
+        "cant do it",
+        "can t do it",
+    )
+    return any(p in normalized for p in phrases)
+
+
+def _negative_followup_question(runtime_context: dict) -> str:
+    platform = (runtime_context.get("known_platform") or "").strip().lower()
+    known_os_version = (runtime_context.get("known_os_version") or "").strip()
+    known_model = (runtime_context.get("known_model") or "").strip()
+    if not platform:
+        return "Which phone brand are you using (Apple, Samsung, Pixel, Oppo, or Xiaomi)?"
+    if platform == "samsung" and not known_model:
+        return "What is your exact Samsung model name (for example, Galaxy S23 Ultra)?"
+    if platform == "oppo" and not known_os_version:
+        return "What is your ColorOS version on this Oppo phone?"
+    if platform == "apple" and not known_os_version:
+        return "What is your iOS or iPadOS version?"
+    if platform == "pixel" and not known_os_version:
+        return "What Android version is running on your Pixel?"
+    if platform == "xiaomi" and not known_os_version:
+        return "What HyperOS or Android version is running on your Xiaomi phone?"
+    return "Which exact step failed, and what do you see on screen instead?"
+
+
 def _name_for_thread(db, thread_id: int) -> str:
     thread = db.query(Thread).filter(Thread.id == thread_id).first()
     if not thread:
@@ -410,6 +450,15 @@ async def generate_wati_reply(
         str(turn_meta.get("button_reply_id") or "").strip().lower()
     )
 
+    if runtime_context.get("unresolved_signal_current_turn") and _is_unresolved_negative_short_reply(
+        current_message
+    ):
+        return {
+            "kind": "text",
+            "message": _negative_followup_question(runtime_context),
+            "message_source": "",
+        }
+
     if support_mode == "tech" and _is_platform_list_selection_only(current_message):
         slug = _infer_platform(current_message)
         if slug in SUPPORTED_PLATFORMS:
@@ -433,15 +482,12 @@ async def generate_wati_reply(
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
-                "When unresolved_signal_current_turn is true: follow system prompt PRECEDENCE and RULE 5 — "
-                "one diagnostic question only this turn; do not call search_support_docs or send_feedback_buttons "
-                "unless the latest user message already contains concrete new failure detail.\n"
-                "Decide follow-up dynamically from the latest user message and context.\n"
-                "If issue is clear and not blocked by PRECEDENCE, call search_support_docs immediately.\n"
-                "If issue is unclear or user says still stuck (and PRECEDENCE applies), ask exactly one short follow-up question.\n"
-                "On unresolved follow-up turns, ask one missing platform-specific refinement before the next search_support_docs call (Apple/Pixel/Xiaomi/Oppo: OS version; Samsung: model).\n"
+                "When unresolved_signal_current_turn is true and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
+                "In that gate: ask exactly one follow-up diagnostic question; do not call search_support_docs; do not call send_feedback_buttons; do not provide troubleshooting steps in this turn.\n"
+                "Ask platform-specific refinement first when missing (Apple: iOS/iPadOS, Samsung: model, Pixel: Android, Oppo: ColorOS, Xiaomi: HyperOS/Android), then wait for user reply.\n"
+                "For Oppo unresolved follow-ups, do not ask phone model; ask ColorOS version first.\n"
+                "If latest user message includes concrete new technical detail, still ask one high-value refinement question first and wait for user reply before retrieval.\n"
                 "If latest user message contains an unsupported phone brand, respond in plain text with supported brands and one continuation question; do not call send_platform_buttons.\n"
-                "After asking that one refinement question, wait for user reply before retrieval.\n"
                 "</runtime_context>"
             )
         ),

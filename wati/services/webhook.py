@@ -51,14 +51,19 @@ def _load_dynamic_copy_prompt() -> str:
     return extracted or fallback
 
 
-def _dynamic_copy(kind: str) -> str:
+def _dynamic_copy(kind: str, context: dict | None = None) -> str:
     prompt = _load_dynamic_copy_prompt()
+    context = context or {}
     goals = {
         "handoff_wait": "Tell user we are connecting to a human support agent and ask them to wait.",
         "handoff_confirm": "Ask user if they want to connect to a human agent now; ask to reply Yes or No.",
         "resolved_ack": "Acknowledge that issue is resolved in a warm way.",
         "resolved_next": "Ask what else the assistant can help with in a friendly way.",
         "feedback_checkin": "Write a natural one-line follow-up check-in after troubleshooting steps. Avoid 'Did this help?'.",
+        "welcome_back_context": (
+            "Given prior thread history, write one short warm welcome-back line that "
+            "references previous help naturally and ends with: How can I help you today?"
+        ),
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
@@ -66,12 +71,14 @@ def _dynamic_copy(kind: str) -> str:
         "resolved_ack": "Happy to know this helped.",
         "resolved_next": "What else can I help you with today?",
         "feedback_checkin": "Please try this once and tell me what you see now.",
+        "welcome_back_context": "Hi, I am your Saksham-Saathi. How can I help you today?",
     }
     try:
+        user_payload = {"goal": goals.get(kind, ""), "context": context}
         r = COPY_LLM.invoke(
             [
                 SystemMessage(content=prompt),
-                HumanMessage(content=goals.get(kind, "")),
+                HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
             ]
         )
         txt = (getattr(r, "content", "") or "").strip()
@@ -642,7 +649,7 @@ def _persist_incoming(phone: str, message: str, payload: dict):
             wati_conversation_id,
         )
 
-        return message_id, thread.id, created_new_thread
+        return message_id, thread.id, conversation.id, created_new_thread
 
     except Exception:
         db.rollback()
@@ -931,7 +938,9 @@ async def process_incoming_message(
         override = None
 
         # 1. Save incoming message
-        message_id, thread_id, created_new_thread = _persist_incoming(phone, incoming_message, payload)
+        message_id, thread_id, conversation_id, created_new_thread = _persist_incoming(
+            phone, incoming_message, payload
+        )
 
         intent_result = {}
         classified_intent = ""
@@ -1297,15 +1306,65 @@ async def process_incoming_message(
             )
             return
 
-        # 2. Session start template message
+        # 2. New thread re-entry message + mode buttons
         if created_new_thread:
-            template_sent = await send_template_message(phone)
-            if template_sent:
-                _update_bot_response(
-                    message_id,
-                    template=getattr(settings, "WATI_TEMPLATE_NAME", "tech_saathi_welcome"),
-                    message_source="wati_template",
+            final_welcome_text = "Hi, I am your Saksham-Saathi. How can I help you today?"
+            db = SessionLocal()
+            try:
+                prev_thread = (
+                    db.query(Thread)
+                    .filter(
+                        Thread.conversation_id == conversation_id,
+                        Thread.id != thread_id,
+                    )
+                    .order_by(desc(Thread.created))
+                    .first()
                 )
+                if prev_thread:
+                    prev_rows = (
+                        db.query(Message)
+                        .filter(
+                            Message.thread_id == prev_thread.id,
+                            Message.is_deleted.is_(False),
+                        )
+                        .order_by(desc(Message.created))
+                        .limit(5)
+                        .all()
+                    )
+                    prev_rows = list(reversed(prev_rows))
+                    previous_turns = []
+                    for row in prev_rows:
+                        user_text = (row.user_message or "").strip()
+                        bot_text = (row.bot_response or "").strip()
+                        if user_text:
+                            previous_turns.append({"role": "user", "content": user_text})
+                        if bot_text:
+                            previous_turns.append({"role": "assistant", "content": bot_text})
+                    final_welcome_text = _dynamic_copy(
+                        "welcome_back_context",
+                        context={"previous_turns": previous_turns},
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Failed preparing new-thread personalized welcome")
+            finally:
+                db.close()
+
+            sent_mode = await send_interactive_buttons_message(
+                phone,
+                final_welcome_text,
+                "mode_buttons",
+            )
+            _update_bot_response(
+                message_id,
+                bot_response=final_welcome_text,
+                message_source="new_thread_reentry",
+                confidence_score=None,
+            )
+            if not sent_mode:
+                logger.error("Failed sending new-thread mode buttons to %s", phone)
+            return
 
         # 3. Generate response from history + tool calling
         db = SessionLocal()
@@ -1352,15 +1411,8 @@ async def process_incoming_message(
                     db.close()
 
                 ack_text = _dynamic_copy("resolved_ack")
-                next_text = _dynamic_copy("resolved_next")
-                sent_ack = await send_message(phone, ack_text)
-                sent_mode = await send_interactive_buttons_message(
-                    phone,
-                    next_text,
-                    "mode_buttons",
-                )
-                sent = sent_ack and sent_mode
-                bot_response = f"{ack_text}\n{next_text}"
+                sent = await send_message(phone, ack_text)
+                bot_response = ack_text
                 if not response_source:
                     response_source = "conversation_control"
             else:
