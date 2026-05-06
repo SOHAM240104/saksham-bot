@@ -19,13 +19,16 @@ def retrieve_support_docs(
     total_start = time.time()
     vector_store = get_vector_store(TECH_VECTOR_COLLECTION)
     filter_dict = {"platform": (device or "").lower()}
+    query_text = (user_query or "").strip()
+    if os_version:
+        query_text = f"{query_text}\nos_version: {os_version}"
 
     if not filter_dict["platform"]:
         return [], "", {}
 
     t1 = time.time()
     scored_docs = vector_store.similarity_search_with_score(
-        user_query,
+        query_text,
         k=top_k,
         filter=filter_dict,
     )
