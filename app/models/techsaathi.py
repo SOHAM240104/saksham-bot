@@ -1,5 +1,6 @@
-from sqlalchemy import Column, ForeignKey, Integer, Table
+from sqlalchemy import Column, ForeignKey, Integer, Table, Date
 from sqlalchemy.orm import relationship
+from app.models.config import GENDER_ENUM
 
 from app.models.base import Base, BaseModel
 
@@ -16,6 +17,8 @@ class TechSaathi(BaseModel):
 
     user_id = Column(Integer, ForeignKey("access_user.id", ondelete="CASCADE"), nullable=False, unique=True)
     language = relationship("Language", secondary=tech_saathi_language_association, lazy="dynamic")
+    dob = Column(Date, nullable=False)
+    gender = Column(GENDER_ENUM, nullable=False, default="male")
 
     def __str__(self):
         return f"{self.user.first_name} [{self.user.is_active}]"

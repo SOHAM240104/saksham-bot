@@ -1,9 +1,13 @@
-from sqlalchemy import Column, String, Boolean,DateTime
+from sqlalchemy import Column, String, Boolean,DateTime, Integer, ForeignKey
 from datetime import datetime
 from sqlalchemy.orm import backref, relationship
 
-from app.models.base import BaseModel
+from app.models.base import BaseModel, BaseNamedEntity
 from app.models.config import USER_TYPE_ENUM
+
+
+class UserRole(BaseNamedEntity):
+    __tablename__ = "access_userrole"
 
 
 class User(BaseModel):
@@ -23,6 +27,11 @@ class User(BaseModel):
     is_superuser = Column(Boolean, default=False)
     is_staff = Column(Boolean, default=False)
     date_joined = Column(DateTime, default=datetime.utcnow)
+    user_role_id = Column(
+    Integer,
+    ForeignKey("access_userrole.id", ondelete="SET NULL"),
+    nullable=True,)
+    user_role = relationship("UserRole", backref="users", foreign_keys="User.user_role_id")
  
    
 
