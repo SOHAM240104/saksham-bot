@@ -153,6 +153,8 @@ async def classify_wati_turn_intent(
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
         "issue_signature must be short snake_case.\n"
         "issue_followup_depth must be integer >= 1.\n"
+        "For SAME ISSUE unresolved flow, escalation threshold is depth 3.\n"
+        "If latest turn is a NEW issue/topic switch, set same_issue_as_previous=false and issue_followup_depth=1.\n"
         "No prose, no markdown.\n"
         "</classification_task>"
     )
@@ -337,45 +339,6 @@ def _looks_like_troubleshooting_steps(text: str) -> bool:
     return False
 
 
-def _is_unresolved_negative_short_reply(text: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized or len(normalized) > 64:
-        return False
-    phrases = (
-        "still stuck",
-        "not working",
-        "same issue",
-        "not resolved",
-        "didnt work",
-        "didn t work",
-        "cant figure it out",
-        "can t figure it out",
-        "cant do it",
-        "can t do it",
-    )
-    return any(p in normalized for p in phrases)
-
-
-def _negative_followup_question(runtime_context: dict) -> str:
-    platform = (runtime_context.get("known_platform") or "").strip().lower()
-    known_os_version = (runtime_context.get("known_os_version") or "").strip()
-    known_model = (runtime_context.get("known_model") or "").strip()
-    if not platform:
-        return "Which phone brand are you using (Apple, Samsung, Pixel, Oppo, or Xiaomi)?"
-    if platform == "samsung" and not known_model:
-        return "What is your exact Samsung model name (for example, Galaxy S23 Ultra)?"
-    if platform == "oppo" and not known_os_version:
-        return "What is your ColorOS version on this Oppo phone?"
-    if platform == "apple" and not known_os_version:
-        return "What is your iOS or iPadOS version?"
-    if platform == "pixel" and not known_os_version:
-        return "What Android version is running on your Pixel?"
-    if platform == "xiaomi" and not known_os_version:
-        return "What HyperOS or Android version is running on your Xiaomi phone?"
-    return "Which exact step failed, and what do you see on screen instead?"
-
-
 def _name_for_thread(db, thread_id: int) -> str:
     thread = db.query(Thread).filter(Thread.id == thread_id).first()
     if not thread:
@@ -449,15 +412,6 @@ async def generate_wati_reply(
     runtime_context["button_reply_id"] = (
         str(turn_meta.get("button_reply_id") or "").strip().lower()
     )
-
-    if runtime_context.get("unresolved_signal_current_turn") and _is_unresolved_negative_short_reply(
-        current_message
-    ):
-        return {
-            "kind": "text",
-            "message": _negative_followup_question(runtime_context),
-            "message_source": "",
-        }
 
     if support_mode == "tech" and _is_platform_list_selection_only(current_message):
         slug = _infer_platform(current_message)
