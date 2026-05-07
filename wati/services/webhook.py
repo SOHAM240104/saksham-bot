@@ -14,6 +14,7 @@ from sqlalchemy import desc
 from app.config.base import SessionLocal
 from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
+from app.models.subscriptions import Subscription, SubscriptionPlan
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
@@ -522,6 +523,26 @@ def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
     )
     db.add(senior)
     db.flush()
+    free_plan = (
+        db.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.plan_type == "free")
+        .first()
+    )
+    if free_plan:
+        existing_subscription = (
+            db.query(Subscription)
+            .filter(Subscription.user_id == senior.id)
+            .first()
+        )
+        if not existing_subscription:
+            db.add(
+                Subscription(
+                    user_id=senior.id,
+                    plan_id=free_plan.id,
+                    status="active",
+                )
+            )
+            db.flush()
     return senior
 
 

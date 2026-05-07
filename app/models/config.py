@@ -12,3 +12,31 @@ THREAD_STATUS_ENUM = Enum(
     "resolved",
     name="thread_status"
 )
+
+SUBSCRIPTION_STATUS_ENUM = Enum(
+    "pending",
+    "active",
+    "cancelled",
+    "expired",
+    name="subscription_status",
+)
+
+
+PLAN_TYPE_ENUM = Enum(
+    "free",
+    "paid",
+    name="plan_type",
+)
+PAID_PLAN_ENUM = Enum(
+    "monthly",
+    "yearly",
+    "lifetime",
+    name="paid_plan",
+)
+INTERVAL_ENUM = Enum(
+    "daily",
+    "weekly",
+    "monthly",
+    "yearly",
+    name="plan_interval",
+)
