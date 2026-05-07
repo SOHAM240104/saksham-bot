@@ -64,6 +64,19 @@ def _dynamic_copy(kind: str, context: dict | None = None) -> str:
             "Given prior thread history, write one short warm welcome-back line that "
             "references previous help naturally and ends with: How can I help you today?"
         ),
+        "thread_summary": (
+            "Given prior thread history, write one short, plain-language summary of what issue "
+            "was discussed and where things ended."
+        ),
+        "thread_topic": (
+            "Given prior thread history, extract only the main issue topic in 3-10 words, "
+            "without resolution status or greeting."
+        ),
+        "welcome_back_blended": (
+            "Write one short, natural welcome-back line that references the prior issue topic from context. "
+            "Sound human and specific to that issue, not template-like. Keep tone positive and warm. "
+            "Do not mention unresolved/failed/not fixed. End by asking how you can help now."
+        ),
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
@@ -71,7 +84,10 @@ def _dynamic_copy(kind: str, context: dict | None = None) -> str:
         "resolved_ack": "Happy to know this helped.",
         "resolved_next": "What else can I help you with today?",
         "feedback_checkin": "Please try this once and tell me what you see now.",
-        "welcome_back_context": "Hi, I am your Saksham-Saathi. How can I help you today?",
+        "welcome_back_context": "Hi, I am your Tech Saathi from Saksham. How can I help you today?",
+        "thread_summary": "Earlier we worked on your previous issue and I can continue from there.",
+        "thread_topic": "your previous phone issue",
+        "welcome_back_blended": "Welcome back. Hope your previous issue is okay now - how can I help today?",
     }
     try:
         user_payload = {"goal": goals.get(kind, ""), "context": context}
@@ -257,7 +273,7 @@ async def read_wati_timeline_state(phone: str) -> str | None:
 
 
 # =========================================================
-# SEND MESSAGE TO WATI (NO STATIC FALLBACKS)
+# SEND MESSAGE TO WATI 
 # =========================================================
 async def send_message(phone: str, message: str) -> bool:
     if not phone:
@@ -920,6 +936,119 @@ def append_human_operator_text_to_latest_message(
         db.close()
 
 
+async def _send_new_chatbot_thread_mode_prompt(
+    phone: str, conversation_id: int, thread_id: int, message_id: int
+) -> bool:
+    """Send mode buttons when a new chatbot thread starts."""
+    final_welcome_text = _dynamic_copy("welcome_back_context")
+    topic_text = ""
+    db = SessionLocal()
+    try:
+        recent_cutoff = datetime.now(UTC) - timedelta(seconds=60)
+        recent_mode_msg = (
+            db.query(Message)
+            .filter(
+                Message.thread_id == thread_id,
+                Message.id != message_id,
+                Message.is_deleted.is_(False),
+                Message.message_source == "new_thread_reentry",
+                Message.created >= recent_cutoff,
+            )
+            .order_by(desc(Message.created))
+            .first()
+        )
+        if recent_mode_msg:
+            logger.info(
+                "Skipping duplicate new-thread prompt thread_id=%s message_id=%s",
+                thread_id,
+                message_id,
+            )
+            db.commit()
+            return True
+
+        prev_thread = (
+            db.query(Thread)
+            .filter(
+                Thread.conversation_id == conversation_id,
+                Thread.id != thread_id,
+            )
+            .order_by(desc(Thread.created))
+            .first()
+        )
+        if prev_thread:
+            prev_rows = (
+                db.query(Message)
+                .filter(
+                    Message.thread_id == prev_thread.id,
+                    Message.is_deleted.is_(False),
+                )
+                .order_by(desc(Message.created))
+                .limit(5)
+                .all()
+            )
+            prev_rows = list(reversed(prev_rows))
+            previous_turns = []
+            for row in prev_rows:
+                user_text = (row.user_message or "").strip()
+                bot_text = (row.bot_response or "").strip()
+                if user_text:
+                    previous_turns.append({"role": "user", "content": user_text})
+                if bot_text:
+                    previous_turns.append({"role": "assistant", "content": bot_text})
+            topic_text = _dynamic_copy(
+                "thread_topic",
+                context={"previous_turns": previous_turns},
+            )
+            if topic_text:
+                normalized = " ".join(topic_text.split())
+                normalized = re.sub(
+                    r"\b(resolved|fixed|solved|closed|completed|done)\b",
+                    "",
+                    normalized,
+                    flags=re.IGNORECASE,
+                ).strip(" .,-")
+                if len(normalized) > 90:
+                    normalized = normalized[:87].rstrip() + "..."
+                if normalized:
+                    final_welcome_text = _dynamic_copy(
+                        "welcome_back_blended",
+                        context={
+                            "issue_topic": normalized,
+                            "previous_turns": previous_turns,
+                        },
+                    )
+                    # Safety guard: force positive tone even if model outputs negative phrasing.
+                    final_welcome_text = re.sub(
+                        r"\b(not resolved|wasn['’]?t resolved|unresolved|not fixed|didn['’]?t work|failed)\b",
+                        "all good",
+                        final_welcome_text,
+                        flags=re.IGNORECASE,
+                    )
+                    if "how can i help" not in final_welcome_text.lower():
+                        final_welcome_text = f"{final_welcome_text.rstrip(' .')} How can I help you today?"
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed preparing new-thread personalized welcome")
+    finally:
+        db.close()
+
+    sent_mode = await send_interactive_buttons_message(
+        phone,
+        final_welcome_text,
+        "mode_buttons",
+    )
+    _update_bot_response(
+        message_id,
+        bot_response=final_welcome_text,
+        message_source="new_thread_reentry",
+        confidence_score=None,
+    )
+    if not sent_mode:
+        logger.error("Failed sending new-thread mode buttons to %s", phone)
+    return sent_mode
+
+
 # =========================================================
 # MAIN ENTRYPOINT
 # =========================================================
@@ -938,7 +1067,7 @@ async def process_incoming_message(
         override = None
 
         # 1. Save incoming message
-        message_id, thread_id, conversation_id, created_new_thread = _persist_incoming(
+        message_id, thread_id, conversation_id, _created_new_thread = _persist_incoming(
             phone, incoming_message, payload
         )
 
@@ -1063,11 +1192,6 @@ async def process_incoming_message(
                 raise
             finally:
                 db.close()
-            _update_bot_response(
-                message_id,
-                bot_response="",
-                message_source="human_resolution",
-            )
             return
 
         # --- Human queue (getMessages) or bot → human escalation ---
@@ -1175,7 +1299,7 @@ async def process_incoming_message(
                 elif (
                     same_issue_as_previous
                     and is_unresolved
-                    and issue_followup_depth >= 4
+                    and issue_followup_depth >= 3
                 ):
                     hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
                         db, thread_id
@@ -1306,64 +1430,47 @@ async def process_incoming_message(
             )
             return
 
-        # 2. New thread re-entry message + mode buttons
-        if created_new_thread:
-            final_welcome_text = "Hi, I am your Saksham-Saathi. How can I help you today?"
-            db = SessionLocal()
-            try:
-                prev_thread = (
-                    db.query(Thread)
-                    .filter(
-                        Thread.conversation_id == conversation_id,
-                        Thread.id != thread_id,
-                    )
-                    .order_by(desc(Thread.created))
-                    .first()
+        # 2. Send re-entry prompt only when user sends first message in a fresh chatbot thread.
+        db = SessionLocal()
+        try:
+            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
+            prior_msg_in_same_thread = (
+                db.query(Message)
+                .filter(
+                    Message.thread_id == thread_id,
+                    Message.is_deleted.is_(False),
+                    Message.id != message_id,
                 )
-                if prev_thread:
-                    prev_rows = (
-                        db.query(Message)
-                        .filter(
-                            Message.thread_id == prev_thread.id,
-                            Message.is_deleted.is_(False),
-                        )
-                        .order_by(desc(Message.created))
-                        .limit(5)
-                        .all()
-                    )
-                    prev_rows = list(reversed(prev_rows))
-                    previous_turns = []
-                    for row in prev_rows:
-                        user_text = (row.user_message or "").strip()
-                        bot_text = (row.bot_response or "").strip()
-                        if user_text:
-                            previous_turns.append({"role": "user", "content": user_text})
-                        if bot_text:
-                            previous_turns.append({"role": "assistant", "content": bot_text})
-                    final_welcome_text = _dynamic_copy(
-                        "welcome_back_context",
-                        context={"previous_turns": previous_turns},
-                    )
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("Failed preparing new-thread personalized welcome")
-            finally:
-                db.close()
+                .first()
+            )
+            prior_thread_exists = (
+                db.query(Thread)
+                .filter(
+                    Thread.conversation_id == conversation_id,
+                    Thread.id != thread_id,
+                )
+                .first()
+            )
+            should_send_reentry = bool(
+                thread_row
+                and thread_row.role == "chatbot"
+                and not prior_msg_in_same_thread
+                and prior_thread_exists
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
-            sent_mode = await send_interactive_buttons_message(
-                phone,
-                final_welcome_text,
-                "mode_buttons",
+        if should_send_reentry:
+            await _send_new_chatbot_thread_mode_prompt(
+                phone=phone,
+                conversation_id=conversation_id,
+                thread_id=thread_id,
+                message_id=message_id,
             )
-            _update_bot_response(
-                message_id,
-                bot_response=final_welcome_text,
-                message_source="new_thread_reentry",
-                confidence_score=None,
-            )
-            if not sent_mode:
-                logger.error("Failed sending new-thread mode buttons to %s", phone)
             return
 
         # 3. Generate response from history + tool calling
@@ -1402,7 +1509,9 @@ async def process_incoming_message(
             if control_action == "resolved":
                 db = SessionLocal()
                 try:
-                    resolve_thread_and_create_new_chatbot_thread(db, thread_id)
+                    new_thread_id = resolve_thread_and_create_new_chatbot_thread(
+                        db, thread_id
+                    )
                     db.commit()
                 except Exception:
                     db.rollback()
