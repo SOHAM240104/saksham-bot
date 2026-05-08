@@ -27,6 +27,7 @@ class User(BaseModel):
     is_superuser = Column(Boolean, default=False)
     is_staff = Column(Boolean, default=False)
     date_joined = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
     user_role_id = Column(
     Integer,
     ForeignKey("access_userrole.id", ondelete="SET NULL"),

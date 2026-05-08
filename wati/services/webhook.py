@@ -15,6 +15,7 @@ from app.config.base import SessionLocal
 from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
 from app.models.subscriptions import Subscription, SubscriptionPlan
+# from app.models.techsaathi import TechSaathi
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
@@ -27,6 +28,44 @@ from wati.settings import settings
 logger = logging.getLogger("wati.services.webhook")
 COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
 
+
+# ===== : DB-DRIVEN HANDOFF ASSIGNEE PICKER - START =====
+# def _pick_handoff_assignee_email() -> str:
+#     db = SessionLocal()
+#     try:
+#         chosen = (
+#             db.query(TechSaathi)
+#             .join(User, User.id == TechSaathi.user_id)
+#             .filter(
+#                 TechSaathi.is_deleted.is_(False),
+#                 TechSaathi.is_active.is_(True),
+#                 User.is_deleted.is_(False),
+#                 TechSaathi.is_active.is_(True),
+#                 User.email.isnot(None),
+#                 User.email != "",
+#             )
+#             .order_by(TechSaathi.assigned_count.asc(), TechSaathi.created.asc())
+#             .first()
+#         )
+#
+#         if not chosen or not chosen.user:
+#             return ""
+#
+#         email = (chosen.user.email or "").strip()
+#         if not email:
+#             return ""
+#
+#         chosen.assigned_count = int(chosen.assigned_count or 0) + 1
+#         db.commit()
+#         return email
+#
+#     except Exception:
+#         db.rollback()
+#         logger.exception("Failed to pick handoff assignee email")
+#         return ""
+#     finally:
+#         db.close()
+#
 
 def _load_dynamic_copy_prompt() -> str:
     fallback = (
@@ -494,8 +533,7 @@ def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
         phone_number=p_plus or phone,
         first_name=first_name,
         user_type="senior",
-        is_superuser=False,
-        is_staff=False,
+  
     
     )
     db.add(user)
@@ -514,36 +552,47 @@ def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
         user_id=user.id,
         initial=initial,
         dob=date(1970, 1, 1),
-        gender="male",
-        onboarding_type="self",
-        zoom_call=False,
-        whatsapp_call=False,
         whatsapp_msg=True,
-        updates=False,
     )
     db.add(senior)
     db.flush()
-    free_plan = (
-        db.query(SubscriptionPlan)
-        .filter(SubscriptionPlan.plan_type == "free")
-        .first()
-    )
-    if free_plan:
-        existing_subscription = (
-            db.query(Subscription)
-            .filter(Subscription.user_id == senior.id)
+    return senior
+
+
+def _subscription_sync(senior_id: int) -> None:
+    db = SessionLocal()
+    try:
+        free_plan = (
+            db.query(SubscriptionPlan)
+            .filter(SubscriptionPlan.plan_type == "free")
             .first()
         )
-        if not existing_subscription:
-            db.add(
-                Subscription(
-                    user_id=senior.id,
-                    plan_id=free_plan.id,
-                    status="active",
-                )
+        if not free_plan:
+            return
+        existing_subscription = (
+            db.query(Subscription)
+            .filter(Subscription.user_id == senior_id)
+            .first()
+        )
+        if existing_subscription:
+            return
+        db.add(
+            Subscription(
+                user_id=senior_id,
+                plan_id=free_plan.id,
+                status="active",
             )
-            db.flush()
-    return senior
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed creating default subscription for senior_id=%s", senior_id)
+    finally:
+        db.close()
+
+
+def _subscription(senior_id: int) -> None:
+    asyncio.create_task(asyncio.to_thread(_subscription_sync, senior_id))
 
 
 # =========================================================
@@ -677,6 +726,7 @@ def _persist_incoming(phone: str, message: str, payload: dict):
         message_id = msg.id
 
         db.commit()
+        _subscription(senior.id)
 
         logger.info(
             "Saved message id=%s phone=%s conv=%s wati_conv=%s",
@@ -700,17 +750,17 @@ def _persist_incoming(phone: str, message: str, payload: dict):
 # =========================================================
 # UPDATE BOT RESPONSE
 # =========================================================
-def _update_bot_response(
+
+def _update_bot_response_sync(
     message_id: int,
     bot_response: str | None = None,
     template: str | None = None,
     message_source: str | None = None,
     confidence_score: float | None = None,
-):
+) -> None:
     db = SessionLocal()
     try:
         msg = db.query(Message).filter(Message.id == message_id).first()
-
         if msg:
             if bot_response is not None:
                 msg.bot_response = bot_response
@@ -723,13 +773,30 @@ def _update_bot_response(
             db.commit()
         else:
             logger.warning("Message not found id=%s", message_id)
-
     except Exception:
         db.rollback()
         logger.exception("Failed updating bot_response")
-
     finally:
         db.close()
+
+
+def _update_bot_response(
+    message_id: int,
+    bot_response: str | None = None,
+    template: str | None = None,
+    message_source: str | None = None,
+    confidence_score: float | None = None,
+) -> None:
+    asyncio.create_task(
+        asyncio.to_thread(
+            _update_bot_response_sync,
+            message_id,
+            bot_response,
+            template,
+            message_source,
+            confidence_score,
+        )
+    )
 
 
 def resolve_thread_and_create_new_chatbot_thread(db, thread_id: int) -> int | None:
@@ -1087,6 +1154,17 @@ async def process_incoming_message(
 
         override = None
 
+        # Block inactive seniors before persisting, so no new conversation/thread/message is created.
+        digits = "".join(c for c in str(phone or "") if c.isdigit())
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+            senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+            if senior and not senior.is_active:
+                return
+        finally:
+            db.close()
+
         # 1. Save incoming message
         message_id, thread_id, conversation_id, _created_new_thread = _persist_incoming(
             phone, incoming_message, payload
@@ -1366,6 +1444,13 @@ async def process_incoming_message(
                 or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
                 or ""
             ).strip()
+            # ===== switch assignee source to DB  =====
+            # assignee_email = _pick_handoff_assignee_email() or (
+            #     getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
+            #     or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
+            #     or ""
+            # ).strip()
+
             channel_number = (getattr(settings, "WATI_CHANNEL_NUMBER", None) or "").strip()
 
             tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
