@@ -4,7 +4,6 @@ import logging
 import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -25,7 +24,23 @@ from wati.services.conversation import (
 )
 from wati.settings import settings
 
-logger = logging.getLogger("wati.services.webhook")
+from .parse import (
+    _extract_button_reply_id,
+    _extract_name,
+    _handoff_confirm_decision,
+    wati_payload_indicates_human_operator,
+)
+# Free-tier thread limit (disabled )
+# from .feature import FreeTierThreadLimitReached, free_thread_limit
+from .wati_webhook import (
+    read_wati_timeline_state,
+    send_interactive_buttons_message,
+    send_interactive_platform_list_message,
+    send_message,
+    send_template_message,
+)
+
+logger = logging.getLogger("wati.services.handling")
 COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
 
 
@@ -76,7 +91,7 @@ def _load_dynamic_copy_prompt() -> str:
         "Keep it concise."
     )
     try:
-        path = Path(__file__).resolve().parents[1] / "llm" / "systemprompt.txt"
+        path = Path(__file__).resolve().parents[2] / "llm" / "systemprompt.txt"
         text = path.read_text(encoding="utf-8")
     except Exception:
         return fallback
@@ -145,380 +160,14 @@ def _dynamic_copy(kind: str, context: dict | None = None) -> str:
     return fallback.get(kind, "How can I help you?")
 
 
-def _handoff_confirm_decision(text: str) -> str:
-    msg = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
-    yes_tokens = {"yes", "y", "haan", "ha", "ok", "okay", "sure", "connect", "transfer"}
-    no_tokens = {"no", "n", "nah", "nope", "not now", "dont", "don't", "later"}
-    if any(tok in msg for tok in yes_tokens):
-        return "YES"
-    if any(tok in msg for tok in no_tokens):
-        return "NO"
-    return "UNCLEAR"
-
-
-def wati_payload_indicates_human_operator(payload: dict | None) -> bool:
-    p = payload or {}
-    if (p.get("operatorName") or "").strip():
-        return True
-    e = (p.get("operatorEmail") or "").strip().lower()
-    return bool(e) and "api-token-user" not in e
-
-
-def wati_response_indicates_success(response: httpx.Response) -> bool:
-    if response.status_code >= 400:
-        return False
-    try:
-        data = response.json()
-    except Exception:
-        return True
-    if isinstance(data, dict) and data.get("result") is False:
-        return False
-    if isinstance(data, dict) and data.get("ok") is False:
-        return False
-    return True
-
-
-def _wati_v1_api_base() -> str:
-    base = settings.WATI_API_ENDPOINT.rstrip("/")
-    tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
-    if tenant and not base.rstrip("/").endswith(tenant):
-        return f"{base}/{tenant}"
-    return base
-
-
-def _timeline_items_from_response(data: dict) -> list:
-    """v1 getMessages uses messages.items; ext v3 used message_list."""
-    if not isinstance(data, dict):
-        return []
-    msgs = data.get("messages")
-    if isinstance(msgs, dict):
-        items = msgs.get("items")
-        if isinstance(items, list):
-            return items
-    raw = data.get("message_list")
-    return raw if isinstance(raw, list) else []
-
-
-def _item_event_type(item: dict) -> str:
-    return str(item.get("eventType") or item.get("event_type") or "").lower()
-
-
-def _item_event_description(item: dict) -> str:
-    return str(item.get("eventDescription") or item.get("event_description") or "")
-
-
-def _item_detailed_description_text(item: dict) -> str:
-    """WATI embeds extra copy under detailedEventDescription (e.g. agentName)."""
-    det = item.get("detailedEventDescription") or item.get("detailed_event_description")
-    if not isinstance(det, dict):
-        return ""
-    parts: list[str] = []
-    for key in ("agentName", "status", "triggerSourceName", "flowName"):
-        v = det.get(key)
-        if isinstance(v, str) and v.strip():
-            parts.append(v.strip())
-    return " ".join(parts)
-
-
-def _item_combined_description(item: dict) -> str:
-    return " ".join(
-        p for p in (_item_event_description(item), _item_detailed_description_text(item)) if p
-    ).strip()
-
-
-def parse_wati_timeline_for_thread(items: list) -> str:
-    if not isinstance(items, list):
-        return "assigned"
-
-    ts_human_assigned = ""
-    ts_closed = ""
-    ts_bot_reopened = ""
-
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-
-        if _item_event_type(it) != "ticket":
-            continue
-
-        desc = _item_combined_description(it).lower()
-        ts = str(it.get("created") or "")
-
-        # human took control
-        if "assigned to" in desc and "bot" not in desc:
-            if ts > ts_human_assigned:
-                ts_human_assigned = ts
-
-        # human closed
-        if "chat has been closed" in desc or "closed by agent" in desc:
-            if ts > ts_closed:
-                ts_closed = ts
-
-        #  bot took back control
-        if "ticket status" in desc and "open" in desc and "bot" in desc:
-            if ts > ts_bot_reopened:
-                ts_bot_reopened = ts
-
-        if "chat has been initialized" in desc:
-            if ts > ts_bot_reopened:
-                ts_bot_reopened = ts
-
-    latest_end = max(ts_closed, ts_bot_reopened)
-
-    if latest_end and latest_end >= ts_human_assigned:
-        return "resolved"
-
-    return "assigned"
-
-
-async def fetch_wati_get_messages(phone: str) -> dict | None:
-    digits = "".join(c for c in str(phone or "") if c.isdigit())
-    if not digits:
-        return None
-    url = f"{_wati_v1_api_base()}/api/v1/getMessages/{quote(digits, safe='')}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(
-                url,
-                headers={
-                    "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-                    "Accept": "application/json",
-                },
-                params={"pageNumber": 1, "pageSize": 200},
-            )
-            logger.info("WATI getMessages status=%s url=%s", r.status_code, url[:140])
-            if r.status_code >= 400:
-                logger.warning("WATI getMessages body=%s", r.text[:500])
-                return None
-            return r.json()
-    except Exception:
-        logger.exception("WATI getMessages failed")
-        return None
-
-
-async def read_wati_timeline_state(phone: str) -> str | None:
-    """resolved | assigned for techsaathi thread.status sync; None if disabled or request failed."""
-    if not getattr(settings, "WATI_EXT_MESSAGES_ENABLED", True):
-        return None
-    data = await fetch_wati_get_messages(phone)
-    if not isinstance(data, dict):
-        return None
-    res = data.get("result")
-    if res is not None and str(res).lower() not in ("success", "true", "1"):
-        if res is False:
-            logger.warning("WATI getMessages unexpected result=%s", res)
-            return None
-    items = _timeline_items_from_response(data)
-    return parse_wati_timeline_for_thread(items)
-
-
-# =========================================================
-# SEND MESSAGE TO WATI 
-# =========================================================
-async def send_message(phone: str, message: str) -> bool:
-    if not phone:
-        logger.warning("Skipping send_message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Empty message, not sending")
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendSessionMessage/{phone}"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    params={"messageText": text},
-                )
-                logger.info(
-                    "WATI send response status=%s text=%s",
-                    response.status_code,
-                    response.text,
-                )
-                return wati_response_indicates_success(response)
-
-        except httpx.TimeoutException:
-            logger.warning("Timeout attempt %s for %s", attempt, phone)
-            await asyncio.sleep(attempt)
-
-        except Exception as exc:
-            logger.exception("Send failed attempt %s: %s", attempt, exc)
-            await asyncio.sleep(attempt)
-
-    return False
-
-
-async def send_interactive_buttons_message(phone: str, message: str, action: str) -> bool:
-    if not phone:
-        logger.warning("Skipping interactive message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Skipping interactive message: empty body")
-        return False
-
+def _default_button_message(action: str) -> str:
     if action == "mode_buttons":
-        buttons = [
-            {"id": "tech", "title": "Tech Help"},
-            {"id": "scam", "title": "Scam Help"},
-        ]
-    elif action == "feedback_buttons":
-        buttons = [
-            {"id": "resolved", "title": "Resolved "},
-            {"id": "not_resolved", "title": "Still Stuck "},
-        ]
-    else:
-        logger.warning("Unknown interactive action=%s", action)
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendInteractiveButtonsMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "body": text,
-        "footer": "",
-        "buttons": [
-            {
-                "text": button["title"],
-            }
-            for button in buttons
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI interactive response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending interactive buttons action=%s", action)
-        return False
-
-
-async def send_interactive_platform_list_message(phone: str, message: str) -> bool:
-    """WhatsApp list message for supported phone brands (up to 10 rows in one message)."""
-    if not phone:
-        logger.warning("Skipping platform list message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Skipping platform list message: empty body")
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendInteractiveListMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "header": "Phone brand",
-        "body": text,
-        "footer": "",
-        "buttonText": "Choose phone",
-        "sections": [
-            {
-                "title": "Supported phones",
-                "rows": [
-                    {"title": "Apple", "description": "iPhone / iPad"},
-                    {"title": "Samsung", "description": "Galaxy"},
-                    {"title": "Pixel", "description": "Google Pixel"},
-                    {"title": "Oppo", "description": ""},
-                    {"title": "Xiaomi", "description": "Redmi / POCO"},
-                ],
-            }
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI interactive list response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending interactive platform list message")
-        return False
-
-
-async def send_template_message(phone: str, parameters: list[str] | None = None) -> bool:
-    if not phone:
-        return False
-
-    template_name = getattr(settings, "WATI_TEMPLATE_NAME", "tech_saathi_welcome")
-    payload = {
-        "template_name": template_name,
-        "broadcast_name": "session_start",
-        "parameters": [
-            {"name": f"{{{{{idx + 1}}}}}", "value": value}
-            for idx, value in enumerate(parameters or [])
-        ],
-    }
-    channel_number = getattr(settings, "WATI_CHANNEL_NUMBER", None)
-    if channel_number:
-        payload["channel_number"] = channel_number
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendTemplateMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI template response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending template message")
-        return False
-
-
-
-def _extract_name(payload: dict) -> str | None:
-    for key in ["senderName", "contactName", "name", "profileName"]:
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()[:512]
-    return None
+        return "How can I help you today?"
+    if action == "platform_buttons":
+        return "Which phone are you using?"
+    if action == "feedback_buttons":
+        return _dynamic_copy("feedback_checkin")
+    return "Please choose an option."
 
 
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
@@ -661,6 +310,7 @@ def _get_or_create_thread(db, conversation: Conversation, now: datetime):
         or not last_message
         or last_message.created < idle_cutoff
     ):
+        # free_thread_limit(db, conversation.id)
         thread = Thread(
             conversation_id=conversation.id,
             role="chatbot",
@@ -807,6 +457,7 @@ def resolve_thread_and_create_new_chatbot_thread(db, thread_id: int) -> int | No
     if thread.role != "chatbot":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     next_thread = Thread(
         conversation_id=thread.conversation_id,
         role="chatbot",
@@ -828,6 +479,7 @@ def resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
     if not thread or thread.role != "chatbot" or thread.status != "assigned":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     human_thread = Thread(
         conversation_id=thread.conversation_id,
         role="techsaathi",
@@ -844,6 +496,7 @@ def resolve_techsaathi_thread_and_create_new_chatbot_thread(db, thread_id: int) 
     if not thread or thread.role != "techsaathi":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     next_thread = Thread(
         conversation_id=thread.conversation_id,
         role="chatbot",
@@ -858,81 +511,6 @@ def _reassign_message_thread(db, message_id: int, new_thread_id: int) -> None:
     msg = db.query(Message).filter(Message.id == message_id).first()
     if msg:
         msg.thread_id = new_thread_id
-
-
-def _extract_button_reply_id(payload: dict | None) -> str | None:
-    raw = payload or {}
-
-    list_reply = raw.get("listReply")
-    if isinstance(list_reply, dict):
-        title = list_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-        reply_id = list_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized
-
-    interactive_button_reply = raw.get("interactiveButtonReply")
-    if isinstance(interactive_button_reply, dict):
-        title = interactive_button_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-            if "resolved" in normalized_title and "stuck" not in normalized_title:
-                return "resolved"
-            if "stuck" in normalized_title or "not resolved" in normalized_title:
-                return "not_resolved"
-        reply_id = interactive_button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"resolved", "not_resolved", "tech", "scam"}:
-                return normalized
-
-    button_reply = raw.get("buttonReply")
-    if isinstance(button_reply, dict):
-        title = button_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-            if "resolved" in normalized_title and "stuck" not in normalized_title:
-                return "resolved"
-            if "stuck" in normalized_title or "not resolved" in normalized_title:
-                return "not_resolved"
-        reply_id = button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            return reply_id.strip().lower()
-
-    interactive_data = raw.get("interactiveData")
-    if isinstance(interactive_data, dict):
-        button_id = interactive_data.get("buttonId")
-        if isinstance(button_id, str) and button_id.strip():
-            return button_id.strip().lower()
-
-    return None
-
-
-def _default_button_message(action: str) -> str:
-    if action == "mode_buttons":
-        return "How can I help you today?"
-    if action == "platform_buttons":
-        return "Which phone are you using?"
-    if action == "feedback_buttons":
-        return _dynamic_copy("feedback_checkin")
-    return "Please choose an option."
 
 
 def append_human_operator_text_to_latest_message(
@@ -1001,6 +579,7 @@ def append_human_operator_text_to_latest_message(
                 if hid:
                     msg.thread_id = hid
             elif thread.role == "chatbot" and thread.status == "resolved":
+                # free_thread_limit(db, thread.conversation_id)
                 human_thread = Thread(
                     conversation_id=thread.conversation_id,
                     role="techsaathi",
@@ -1656,5 +1235,21 @@ async def process_incoming_message(
         if not sent:
             logger.error("Failed sending message to %s", phone)
 
+    # except FreeTierThreadLimitReached:
+    #     upgrade_text = (
+    #         "You have reached your free plan limit. "
+    #         "Please upgrade to continue."
+    #     )
+    #     await send_message(phone, upgrade_text)
+    #     try:
+    #         _update_bot_response(
+    #             message_id,
+    #             bot_response=upgrade_text,
+    #             message_source="free_thread_limit",
+    #             confidence_score=None,
+    #         )
+    #     except Exception:
+    #         pass
+    #     return
     except Exception:
         logger.exception("Processing failed for phone=%s", phone)
