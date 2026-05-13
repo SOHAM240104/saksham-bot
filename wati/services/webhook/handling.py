@@ -1,13 +1,8 @@
 import asyncio
 import json
 import logging
-import re
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from sqlalchemy import desc
 
 from app.config.base import SessionLocal
@@ -22,6 +17,7 @@ from wati.services.conversation import (
     conversation_control,
     generate_wati_reply,
 )
+from wati.services.dynamic_copy import dynamic_copy as _dynamic_copy
 from wati.settings import settings
 
 from .parse import (
@@ -41,7 +37,6 @@ from .wati_webhook import (
 )
 
 logger = logging.getLogger("wati.services.handling")
-COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
 
 
 # ===== : DB-DRIVEN HANDOFF ASSIGNEE PICKER - START =====
@@ -82,85 +77,8 @@ COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
 #         db.close()
 #
 
-def _load_dynamic_copy_prompt() -> str:
-    fallback = (
-        "You are generating outbound WhatsApp support copy.\n"
-        "Return exactly ONE sentence, plain text only.\n"
-        "No emojis. No bullets. No markdown.\n"
-        "Tone: warm, calm, human.\n"
-        "Keep it concise."
-    )
-    try:
-        path = Path(__file__).resolve().parents[2] / "llm" / "systemprompt.txt"
-        text = path.read_text(encoding="utf-8")
-    except Exception:
-        return fallback
-    m = re.search(
-        r"<dynamic_copy_prompt>\s*(.*?)\s*</dynamic_copy_prompt>",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        return fallback
-    extracted = (m.group(1) or "").strip()
-    return extracted or fallback
-
-
-def _dynamic_copy(kind: str, context: dict | None = None) -> str:
-    prompt = _load_dynamic_copy_prompt()
-    context = context or {}
-    goals = {
-        "handoff_wait": "Tell user we are connecting to a human support agent and ask them to wait.",
-        "handoff_confirm": "Ask user if they want to connect to a human agent now; ask to reply Yes or No.",
-        "resolved_ack": "Acknowledge that issue is resolved in a warm way.",
-        "resolved_next": "Ask what else the assistant can help with in a friendly way.",
-        "feedback_checkin": "Write a natural one-line follow-up check-in after troubleshooting steps. Avoid 'Did this help?'.",
-        "welcome_back_context": (
-            "Given prior thread history, write one short warm welcome-back line that "
-            "references previous help naturally and ends with: How can I help you today?"
-        ),
-        "thread_summary": (
-            "Given prior thread history, write one short, plain-language summary of what issue "
-            "was discussed and where things ended."
-        ),
-        "thread_topic": (
-            "Given prior thread history, extract only the main issue topic in 3-10 words, "
-            "without resolution status or greeting."
-        ),
-        "welcome_back_blended": (
-            "Write one short, natural welcome-back line that references the prior issue topic from context. "
-            "Sound human and specific to that issue, not template-like. Keep tone positive and warm. "
-            "Do not mention unresolved/failed/not fixed. End by asking how you can help now."
-        ),
-    }
-    fallback = {
-        "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
-        "handoff_confirm": "Would you like me to connect you to a human agent now? Please reply Yes or No.",
-        "resolved_ack": "Happy to know this helped.",
-        "resolved_next": "What else can I help you with today?",
-        "feedback_checkin": "Please try this once and tell me what you see now.",
-        "welcome_back_context": "Hi, I am your Tech Saathi from Saksham. How can I help you today?",
-        "thread_summary": "Earlier we worked on your previous issue and I can continue from there.",
-        "thread_topic": "your previous phone issue",
-        "welcome_back_blended": "Welcome back. Hope your previous issue is okay now - how can I help today?",
-    }
-    try:
-        user_payload = {"goal": goals.get(kind, ""), "context": context}
-        r = COPY_LLM.invoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
-            ]
-        )
-        txt = (getattr(r, "content", "") or "").strip()
-        if txt:
-            return txt
-    except Exception:
-        logger.exception("Dynamic copy generation failed kind=%s", kind)
-    return fallback.get(kind, "How can I help you?")
-
-
 def _default_button_message(action: str) -> str:
+    #users always see readable caption text with button/list messages when the main LLM doesn’t supply one.
     if action == "mode_buttons":
         return "How can I help you today?"
     if action == "platform_buttons":
@@ -603,119 +521,6 @@ def append_human_operator_text_to_latest_message(
         db.close()
 
 
-async def _send_new_chatbot_thread_mode_prompt(
-    phone: str, conversation_id: int, thread_id: int, message_id: int
-) -> bool:
-    """Send mode buttons when a new chatbot thread starts."""
-    final_welcome_text = _dynamic_copy("welcome_back_context")
-    topic_text = ""
-    db = SessionLocal()
-    try:
-        recent_cutoff = datetime.now(UTC) - timedelta(seconds=60)
-        recent_mode_msg = (
-            db.query(Message)
-            .filter(
-                Message.thread_id == thread_id,
-                Message.id != message_id,
-                Message.is_deleted.is_(False),
-                Message.message_source == "new_thread_reentry",
-                Message.created >= recent_cutoff,
-            )
-            .order_by(desc(Message.created))
-            .first()
-        )
-        if recent_mode_msg:
-            logger.info(
-                "Skipping duplicate new-thread prompt thread_id=%s message_id=%s",
-                thread_id,
-                message_id,
-            )
-            db.commit()
-            return True
-
-        prev_thread = (
-            db.query(Thread)
-            .filter(
-                Thread.conversation_id == conversation_id,
-                Thread.id != thread_id,
-            )
-            .order_by(desc(Thread.created))
-            .first()
-        )
-        if prev_thread:
-            prev_rows = (
-                db.query(Message)
-                .filter(
-                    Message.thread_id == prev_thread.id,
-                    Message.is_deleted.is_(False),
-                )
-                .order_by(desc(Message.created))
-                .limit(5)
-                .all()
-            )
-            prev_rows = list(reversed(prev_rows))
-            previous_turns = []
-            for row in prev_rows:
-                user_text = (row.user_message or "").strip()
-                bot_text = (row.bot_response or "").strip()
-                if user_text:
-                    previous_turns.append({"role": "user", "content": user_text})
-                if bot_text:
-                    previous_turns.append({"role": "assistant", "content": bot_text})
-            topic_text = _dynamic_copy(
-                "thread_topic",
-                context={"previous_turns": previous_turns},
-            )
-            if topic_text:
-                normalized = " ".join(topic_text.split())
-                normalized = re.sub(
-                    r"\b(resolved|fixed|solved|closed|completed|done)\b",
-                    "",
-                    normalized,
-                    flags=re.IGNORECASE,
-                ).strip(" .,-")
-                if len(normalized) > 90:
-                    normalized = normalized[:87].rstrip() + "..."
-                if normalized:
-                    final_welcome_text = _dynamic_copy(
-                        "welcome_back_blended",
-                        context={
-                            "issue_topic": normalized,
-                            "previous_turns": previous_turns,
-                        },
-                    )
-                    # Safety guard: force positive tone even if model outputs negative phrasing.
-                    final_welcome_text = re.sub(
-                        r"\b(not resolved|wasn['’]?t resolved|unresolved|not fixed|didn['’]?t work|failed)\b",
-                        "all good",
-                        final_welcome_text,
-                        flags=re.IGNORECASE,
-                    )
-                    if "how can i help" not in final_welcome_text.lower():
-                        final_welcome_text = f"{final_welcome_text.rstrip(' .')} How can I help you today?"
-        db.commit()
-    except Exception:
-        db.rollback()
-        logger.exception("Failed preparing new-thread personalized welcome")
-    finally:
-        db.close()
-
-    sent_mode = await send_interactive_buttons_message(
-        phone,
-        final_welcome_text,
-        "mode_buttons",
-    )
-    _update_bot_response(
-        message_id,
-        bot_response=final_welcome_text,
-        message_source="new_thread_reentry",
-        confidence_score=None,
-    )
-    if not sent_mode:
-        logger.error("Failed sending new-thread mode buttons to %s", phone)
-    return sent_mode
-
-
 # =========================================================
 # MAIN ENTRYPOINT
 # =========================================================
@@ -1115,7 +920,8 @@ async def process_incoming_message(
             )
             return
 
-        # 2. Send re-entry prompt only when user sends first message in a fresh chatbot thread.
+        # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
+        fresh_chatbot_thread = False
         db = SessionLocal()
         try:
             thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
@@ -1136,7 +942,7 @@ async def process_incoming_message(
                 )
                 .first()
             )
-            should_send_reentry = bool(
+            fresh_chatbot_thread = bool(
                 thread_row
                 and thread_row.role == "chatbot"
                 and not prior_msg_in_same_thread
@@ -1149,15 +955,6 @@ async def process_incoming_message(
         finally:
             db.close()
 
-        if should_send_reentry:
-            await _send_new_chatbot_thread_mode_prompt(
-                phone=phone,
-                conversation_id=conversation_id,
-                thread_id=thread_id,
-                message_id=message_id,
-            )
-            return
-
         # 3. Generate response from history + tool calling
         db = SessionLocal()
         try:
@@ -1165,6 +962,7 @@ async def process_incoming_message(
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
                 "unresolved_rounds": issue_followup_depth,
+                "fresh_chatbot_thread": fresh_chatbot_thread,
             }
             llm_result = override or await generate_wati_reply(
                 db,

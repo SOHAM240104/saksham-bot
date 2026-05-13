@@ -12,6 +12,7 @@ from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
 from app.models.user import User
 from wati.llm.rag_chain import search_support_docs
+from wati.services.dynamic_copy import dynamic_copy
 
 logger = logging.getLogger("wati.services.conversation")
 MODEL_NAME = "gpt-4.1-mini"
@@ -148,7 +149,7 @@ async def classify_wati_turn_intent(
         "Based on the system policy above, classify latest turn state.\n"
         "Return JSON only with keys:\n"
         "intent, same_issue_as_previous, is_unresolved_followup, issue_signature, "
-        "issue_followup_depth, handoff_recommended.\n"
+        "issue_followup_depth.\n"
         "Treat short unresolved-negative continuations like 'still stuck', 'not resolved', 'same issue', 'not working', 'didn't work', 'can't figure it out', 'can't do it' (without new technical detail) as is_unresolved_followup=true and same_issue_as_previous=true.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
         "issue_signature must be short snake_case.\n"
@@ -198,14 +199,13 @@ async def classify_wati_turn_intent(
         issue_followup_depth = 1
     if issue_followup_depth < 1:
         issue_followup_depth = 1
-    handoff_recommended = bool(parsed.get("handoff_recommended"))
+    
     return {
         "intent": intent,
         "same_issue_as_previous": same_issue,
         "is_unresolved_followup": unresolved_followup,
         "issue_signature": issue_signature,
         "issue_followup_depth": issue_followup_depth,
-        "handoff_recommended": handoff_recommended,
     }
 
 
@@ -392,6 +392,107 @@ def _infer_runtime_context(history: list[dict]) -> dict:
     }
 
 
+def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
+    """
+    Load last resolved-thread turns plus short topic/summary for continuity hints.
+    Used when fresh_chatbot_thread is true (first message on new thread after rollover).
+    """
+    empty: dict[str, str] = {
+        "prior_issue_topic": "",
+        "prior_thread_summary": "",
+        "prior_turns_snippet": "",
+        "prior_welcome_blend": "",
+    }
+    thread = db.query(Thread).filter(Thread.id == thread_id).first()
+    if not thread:
+        return empty
+    prev_thread = (
+        db.query(Thread)
+        .filter(
+            Thread.conversation_id == thread.conversation_id,
+            Thread.id != thread_id,
+        )
+        .order_by(desc(Thread.created))
+        .first()
+    )
+    if not prev_thread:
+        return empty
+    prev_rows = (
+        db.query(Message)
+        .filter(
+            Message.thread_id == prev_thread.id,
+            Message.is_deleted.is_(False),
+        )
+        .order_by(desc(Message.created))
+        .limit(5)
+        .all()
+    )
+    prev_rows = list(reversed(prev_rows))
+    previous_turns: list[dict] = []
+    lines_for_snippet: list[str] = []
+    for row in prev_rows:
+        user_text = (row.user_message or "").strip()
+        bot_text = (row.bot_response or "").strip()
+        if user_text:
+            previous_turns.append({"role": "user", "content": user_text})
+            lines_for_snippet.append(f"User: {user_text[:200]}")
+        if bot_text:
+            previous_turns.append({"role": "assistant", "content": bot_text})
+            lines_for_snippet.append(f"Assistant: {bot_text[:200]}")
+    if not previous_turns:
+        return empty
+    topic_raw = dynamic_copy("thread_topic", context={"previous_turns": previous_turns})
+    topic_raw = (topic_raw or "").strip()
+    normalized = ""
+    if topic_raw:
+        normalized = " ".join(topic_raw.split())
+        normalized = re.sub(
+            r"\b(resolved|fixed|solved|closed|completed|done)\b",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip(" .,-")
+        if len(normalized) > 90:
+            normalized = normalized[:87].rstrip() + "..."
+    snippet = " | ".join(lines_for_snippet)
+    snippet = snippet.replace("<", " ").replace(">", " ")
+    if len(snippet) > 900:
+        snippet = snippet[:897] + "..."
+
+    prior_welcome_blend = ""
+    if normalized:
+        blended = dynamic_copy(
+            "welcome_back_blended",
+            context={
+                "issue_topic": normalized,
+                "previous_turns": previous_turns,
+            },
+        )
+        blended = (blended or "").strip()
+        blended = re.sub(
+            r"\b(not resolved|unresolved|not fixed|failed|did not work|didn't work)\b",
+            "all good",
+            blended,
+            flags=re.IGNORECASE,
+        )
+        if "how can i help" not in blended.lower():
+            blended = f"{blended.rstrip(' .')} How can I help you today?"
+        prior_welcome_blend = blended.strip()
+    else:
+        prior_welcome_blend = (
+            dynamic_copy("welcome_back_context", context={"previous_turns": previous_turns})
+            or ""
+        ).strip()
+
+    return {
+        "prior_issue_topic": normalized or "",
+        # Same thread_topic LLM output as prior_issue_topic (raw); normalized is cleaned for blending.
+        "prior_thread_summary": topic_raw,
+        "prior_turns_snippet": snippet,
+        "prior_welcome_blend": prior_welcome_blend,
+    }
+
+
 async def generate_wati_reply(
     db,
     thread_id: int,
@@ -412,6 +513,17 @@ async def generate_wati_reply(
     runtime_context["button_reply_id"] = (
         str(turn_meta.get("button_reply_id") or "").strip().lower()
     )
+    fresh_chatbot_thread = bool(turn_meta.get("fresh_chatbot_thread"))
+    prior_issue_topic = ""
+    prior_thread_summary = ""
+    prior_turns_snippet = ""
+    prior_welcome_blend = ""
+    if fresh_chatbot_thread:
+        snap = _prior_thread_snapshot(db, thread_id)
+        prior_issue_topic = snap.get("prior_issue_topic") or ""
+        prior_thread_summary = snap.get("prior_thread_summary") or ""
+        prior_turns_snippet = snap.get("prior_turns_snippet") or ""
+        prior_welcome_blend = snap.get("prior_welcome_blend") or ""
 
     if support_mode == "tech" and _is_platform_list_selection_only(current_message):
         slug = _infer_platform(current_message)
@@ -428,6 +540,11 @@ async def generate_wati_reply(
         SystemMessage(
             content=(
                 "<runtime_context>\n"
+                f"fresh_chatbot_thread: {fresh_chatbot_thread}\n"
+                f"prior_welcome_blend: {prior_welcome_blend or 'none'}\n"
+                f"prior_issue_topic: {prior_issue_topic or 'none'}\n"
+                f"prior_thread_summary: {prior_thread_summary or 'none'}\n"
+                f"prior_turns_snippet: {prior_turns_snippet or 'none'}\n"
                 f"support_mode: {support_mode or 'none'}\n"
                 f"known_platform: {runtime_context.get('known_platform') or 'unknown'}\n"
                 f"known_os_version: {runtime_context.get('known_os_version') or 'unknown'}\n"
@@ -436,6 +553,7 @@ async def generate_wati_reply(
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
+                "When fresh_chatbot_thread is true: follow FRESH_THREAD_CONTINUITY in system prompt — for greetings/ambiguous openers, prefer prior_welcome_blend in send_mode_buttons when not none (warm welcome + prior issue + how can I help); prior_thread_summary is optional detail, not required for the button message.\n"
                 "When unresolved_signal_current_turn is true and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
                 "In that gate: ask exactly one follow-up diagnostic question; do not call search_support_docs; do not call send_feedback_buttons; do not provide troubleshooting steps in this turn.\n"
                 "Ask platform-specific refinement first when missing (Apple: iOS/iPadOS, Samsung: model, Pixel: Android, Oppo: ColorOS, Xiaomi: HyperOS/Android), then wait for user reply.\n"
