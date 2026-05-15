@@ -219,6 +219,18 @@ def _user_chose_scam_support(text: str) -> bool:
     return t in {"scam", "scam help"}
 
 
+def _is_scam_help_turn(message: str, button_reply_id: str) -> bool:
+    return (button_reply_id or "").strip().lower() == "scam" or _user_chose_scam_support(message)
+
+
+def _should_block_scam_retrieval(support_mode: str, message: str, button_reply_id: str) -> bool:
+    if (support_mode or "").strip().lower() != "scam":
+        return False
+    if _is_scam_help_turn(message, button_reply_id):
+        return True
+    return _is_platform_list_selection_only(message)
+
+
 def _is_platform_list_selection_only(text: str) -> bool:
     t = (text or "").strip().lower().rstrip(".!? ")
     return t in PLATFORM_LIST_SELECTION_TOKENS
@@ -475,8 +487,6 @@ def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
             blended,
             flags=re.IGNORECASE,
         )
-        if "how can i help" not in blended.lower():
-            blended = f"{blended.rstrip(' .')} How can I help you today?"
         prior_welcome_blend = blended.strip()
     else:
         prior_welcome_blend = (
@@ -525,6 +535,29 @@ async def generate_wati_reply(
         prior_turns_snippet = snap.get("prior_turns_snippet") or ""
         prior_welcome_blend = snap.get("prior_welcome_blend") or ""
 
+    button_reply_id = (turn_meta.get("button_reply_id") or "").strip().lower()
+
+    if _is_scam_help_turn(current_message, button_reply_id):
+        scam_msg = dynamic_copy(
+            "scam_redirect",
+            context={"customer_name": customer_name or ""},
+        ).strip()
+        return {
+            "kind": "action",
+            "action": "platform_buttons",
+            "message": scam_msg,
+            "message_source": "scam_unavailable",
+        }
+
+    if support_mode == "scam" and _is_platform_list_selection_only(current_message):
+        slug = _infer_platform(current_message)
+        if slug in SUPPORTED_PLATFORMS:
+            return {
+                "kind": "text",
+                "message": _issue_prompt_for_platform(slug),
+                "message_source": "scam_unavailable",
+            }
+
     if support_mode == "tech" and _is_platform_list_selection_only(current_message):
         slug = _infer_platform(current_message)
         if slug in SUPPORTED_PLATFORMS:
@@ -553,13 +586,14 @@ async def generate_wati_reply(
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
-                "When fresh_chatbot_thread is true: follow FRESH_THREAD_CONTINUITY in system prompt — for greetings/ambiguous openers, prefer prior_welcome_blend in send_mode_buttons when not none (warm welcome + prior issue + how can I help); prior_thread_summary is optional detail, not required for the button message.\n"
+                "When fresh_chatbot_thread is true: use prior_welcome_blend verbatim in send_mode_buttons when not none — do not append a second help/assist closing.\n"
                 "When unresolved_signal_current_turn is true and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
                 "In that gate: ask exactly one follow-up diagnostic question; do not call search_support_docs; do not call send_feedback_buttons; do not provide troubleshooting steps in this turn.\n"
                 "Ask platform-specific refinement first when missing (Apple: iOS/iPadOS, Samsung: model, Pixel: Android, Oppo: ColorOS, Xiaomi: HyperOS/Android), then wait for user reply.\n"
                 "For Oppo unresolved follow-ups, do not ask phone model; ask ColorOS version first.\n"
                 "If latest user message includes concrete new technical detail, still ask one high-value refinement question first and wait for user reply before retrieval.\n"
                 "If latest user message contains an unsupported phone brand, respond in plain text with supported brands and one continuation question; do not call send_platform_buttons.\n"
+                "Scam Help (button_reply_id scam): handled in code with scam_redirect + platform_buttons only — no send_mode_buttons, no scam retrieval.\n"
                 "</runtime_context>"
             )
         ),
@@ -598,6 +632,20 @@ async def generate_wati_reply(
             tool_call_id = tool_call.get("id", "tool-call")
 
             if tool_name == "search_support_docs":
+                if _should_block_scam_retrieval(
+                    support_mode, current_message, button_reply_id
+                ):
+                    messages.append(
+                        ToolMessage(
+                            content=(
+                                "Scam support is still being built. Do not retrieve scam playbook. "
+                                "Ask what phone issue the user needs help with (plain text only)."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name="search_support_docs",
+                        )
+                    )
+                    continue
                 platform = str(args.get("platform") or "").strip().lower()
                 if not platform:
                     platform = (runtime_context.get("known_platform") or "").strip().lower()
@@ -652,6 +700,17 @@ async def generate_wati_reply(
                 continue
 
             if tool_name == "send_mode_buttons":
+                if (support_mode or "").strip().lower() == "scam":
+                    scam_msg = dynamic_copy(
+                        "scam_redirect",
+                        context={"customer_name": customer_name or ""},
+                    ).strip()
+                    return {
+                        "kind": "action",
+                        "action": "platform_buttons",
+                        "message": scam_msg or (args.get("message") or "").strip(),
+                        "message_source": "scam_unavailable",
+                    }
                 return {
                     "kind": "action",
                     "action": "mode_buttons",

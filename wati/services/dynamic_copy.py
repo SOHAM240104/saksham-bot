@@ -58,6 +58,11 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
             "issue (use issue_topic from context in plain words — no specs, OS versions, or step lists), "
             "and close once with 'How can I help you today?' in a warm, human tone — not a ticket recap."
         ),
+        "scam_redirect": (
+            "User chose Scam Help. Say we are still working on scam support in a warm way. "
+            "Offer phone troubleshooting and ask them to choose their phone brand to continue. "
+            "One or two short sentences. Do not mention Tech Help or Scam Help buttons."
+        ),
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
@@ -68,6 +73,10 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "welcome_back_context": "Hi, I am your Tech Saathi from Saksham. How can I help you today?",
         "thread_topic": "your previous phone issue",
         "welcome_back_blended": "Welcome back. Hope your previous issue is okay now - how can I help today?",
+        "scam_redirect": (
+            "We're still working on the scam-help part. "
+            "I can help with phone issues — please choose your phone brand to continue."
+        ),
     }
     try:
         user_payload = {"goal": goals.get(kind, ""), "context": context}
