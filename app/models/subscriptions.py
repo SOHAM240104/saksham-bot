@@ -10,7 +10,6 @@ class SubscriptionPlan(BaseModel):
     identity = Column(String(255), nullable=False)
     description = Column(String, nullable=True)
     plan_type = Column(PLAN_TYPE_ENUM, nullable=False)
-    base_plan = Column(PAID_PLAN_ENUM, nullable=True)
     amount = Column(Integer, nullable=False)  
     currency = Column(String(10), nullable=False, default="INR")
     interval = Column(INTERVAL_ENUM, nullable=True)

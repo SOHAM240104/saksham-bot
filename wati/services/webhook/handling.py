@@ -1,20 +1,15 @@
 import asyncio
 import json
 import logging
-import re
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-from urllib.parse import quote
-
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from sqlalchemy import desc
 
 from app.config.base import SessionLocal
 from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
 from app.models.subscriptions import Subscription, SubscriptionPlan
+# from app.models.techsaathi import TechSaathi
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
@@ -22,464 +17,75 @@ from wati.services.conversation import (
     conversation_control,
     generate_wati_reply,
 )
+from wati.services.dynamic_copy import dynamic_copy as _dynamic_copy
 from wati.settings import settings
 
-logger = logging.getLogger("wati.services.webhook")
-COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
+from .parse import (
+    _extract_button_reply_id,
+    _extract_name,
+    _handoff_confirm_decision,
+    wati_payload_indicates_human_operator,
+)
+# Free-tier thread limit (disabled )
+# from .feature import FreeTierThreadLimitReached, free_thread_limit
+from .wati_webhook import (
+    read_wati_timeline_state,
+    send_interactive_buttons_message,
+    send_interactive_platform_list_message,
+    send_message,
+    send_template_message,
+)
+
+logger = logging.getLogger("wati.services.handling")
 
 
-def _load_dynamic_copy_prompt() -> str:
-    fallback = (
-        "You are generating outbound WhatsApp support copy.\n"
-        "Return exactly ONE sentence, plain text only.\n"
-        "No emojis. No bullets. No markdown.\n"
-        "Tone: warm, calm, human.\n"
-        "Keep it concise."
-    )
-    try:
-        path = Path(__file__).resolve().parents[1] / "llm" / "systemprompt.txt"
-        text = path.read_text(encoding="utf-8")
-    except Exception:
-        return fallback
-    m = re.search(
-        r"<dynamic_copy_prompt>\s*(.*?)\s*</dynamic_copy_prompt>",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        return fallback
-    extracted = (m.group(1) or "").strip()
-    return extracted or fallback
+# ===== : DB-DRIVEN HANDOFF ASSIGNEE PICKER - START =====
+# def _pick_handoff_assignee_email() -> str:
+#     db = SessionLocal()
+#     try:
+#         chosen = (
+#             db.query(TechSaathi)
+#             .join(User, User.id == TechSaathi.user_id)
+#             .filter(
+#                 TechSaathi.is_deleted.is_(False),
+#                 TechSaathi.is_active.is_(True),
+#                 User.is_deleted.is_(False),
+#                 TechSaathi.is_active.is_(True),
+#                 User.email.isnot(None),
+#                 User.email != "",
+#             )
+#             .order_by(TechSaathi.assigned_count.asc(), TechSaathi.created.asc())
+#             .first()
+#         )
+#
+#         if not chosen or not chosen.user:
+#             return ""
+#
+#         email = (chosen.user.email or "").strip()
+#         if not email:
+#             return ""
+#
+#         chosen.assigned_count = int(chosen.assigned_count or 0) + 1
+#         db.commit()
+#         return email
+#
+#     except Exception:
+#         db.rollback()
+#         logger.exception("Failed to pick handoff assignee email")
+#         return ""
+#     finally:
+#         db.close()
+#
 
-
-def _dynamic_copy(kind: str, context: dict | None = None) -> str:
-    prompt = _load_dynamic_copy_prompt()
-    context = context or {}
-    goals = {
-        "handoff_wait": "Tell user we are connecting to a human support agent and ask them to wait.",
-        "handoff_confirm": "Ask user if they want to connect to a human agent now; ask to reply Yes or No.",
-        "resolved_ack": "Acknowledge that issue is resolved in a warm way.",
-        "resolved_next": "Ask what else the assistant can help with in a friendly way.",
-        "feedback_checkin": "Write a natural one-line follow-up check-in after troubleshooting steps. Avoid 'Did this help?'.",
-        "welcome_back_context": (
-            "Given prior thread history, write one short warm welcome-back line that "
-            "references previous help naturally and ends with: How can I help you today?"
-        ),
-        "thread_summary": (
-            "Given prior thread history, write one short, plain-language summary of what issue "
-            "was discussed and where things ended."
-        ),
-        "thread_topic": (
-            "Given prior thread history, extract only the main issue topic in 3-10 words, "
-            "without resolution status or greeting."
-        ),
-        "welcome_back_blended": (
-            "Write one short, natural welcome-back line that references the prior issue topic from context. "
-            "Sound human and specific to that issue, not template-like. Keep tone positive and warm. "
-            "Do not mention unresolved/failed/not fixed. End by asking how you can help now."
-        ),
-    }
-    fallback = {
-        "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
-        "handoff_confirm": "Would you like me to connect you to a human agent now? Please reply Yes or No.",
-        "resolved_ack": "Happy to know this helped.",
-        "resolved_next": "What else can I help you with today?",
-        "feedback_checkin": "Please try this once and tell me what you see now.",
-        "welcome_back_context": "Hi, I am your Tech Saathi from Saksham. How can I help you today?",
-        "thread_summary": "Earlier we worked on your previous issue and I can continue from there.",
-        "thread_topic": "your previous phone issue",
-        "welcome_back_blended": "Welcome back. Hope your previous issue is okay now - how can I help today?",
-    }
-    try:
-        user_payload = {"goal": goals.get(kind, ""), "context": context}
-        r = COPY_LLM.invoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
-            ]
-        )
-        txt = (getattr(r, "content", "") or "").strip()
-        if txt:
-            return txt
-    except Exception:
-        logger.exception("Dynamic copy generation failed kind=%s", kind)
-    return fallback.get(kind, "How can I help you?")
-
-
-def _handoff_confirm_decision(text: str) -> str:
-    msg = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
-    yes_tokens = {"yes", "y", "haan", "ha", "ok", "okay", "sure", "connect", "transfer"}
-    no_tokens = {"no", "n", "nah", "nope", "not now", "dont", "don't", "later"}
-    if any(tok in msg for tok in yes_tokens):
-        return "YES"
-    if any(tok in msg for tok in no_tokens):
-        return "NO"
-    return "UNCLEAR"
-
-
-def wati_payload_indicates_human_operator(payload: dict | None) -> bool:
-    p = payload or {}
-    if (p.get("operatorName") or "").strip():
-        return True
-    e = (p.get("operatorEmail") or "").strip().lower()
-    return bool(e) and "api-token-user" not in e
-
-
-def wati_response_indicates_success(response: httpx.Response) -> bool:
-    if response.status_code >= 400:
-        return False
-    try:
-        data = response.json()
-    except Exception:
-        return True
-    if isinstance(data, dict) and data.get("result") is False:
-        return False
-    if isinstance(data, dict) and data.get("ok") is False:
-        return False
-    return True
-
-
-def _wati_v1_api_base() -> str:
-    base = settings.WATI_API_ENDPOINT.rstrip("/")
-    tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
-    if tenant and not base.rstrip("/").endswith(tenant):
-        return f"{base}/{tenant}"
-    return base
-
-
-def _timeline_items_from_response(data: dict) -> list:
-    """v1 getMessages uses messages.items; ext v3 used message_list."""
-    if not isinstance(data, dict):
-        return []
-    msgs = data.get("messages")
-    if isinstance(msgs, dict):
-        items = msgs.get("items")
-        if isinstance(items, list):
-            return items
-    raw = data.get("message_list")
-    return raw if isinstance(raw, list) else []
-
-
-def _item_event_type(item: dict) -> str:
-    return str(item.get("eventType") or item.get("event_type") or "").lower()
-
-
-def _item_event_description(item: dict) -> str:
-    return str(item.get("eventDescription") or item.get("event_description") or "")
-
-
-def _item_detailed_description_text(item: dict) -> str:
-    """WATI embeds extra copy under detailedEventDescription (e.g. agentName)."""
-    det = item.get("detailedEventDescription") or item.get("detailed_event_description")
-    if not isinstance(det, dict):
-        return ""
-    parts: list[str] = []
-    for key in ("agentName", "status", "triggerSourceName", "flowName"):
-        v = det.get(key)
-        if isinstance(v, str) and v.strip():
-            parts.append(v.strip())
-    return " ".join(parts)
-
-
-def _item_combined_description(item: dict) -> str:
-    return " ".join(
-        p for p in (_item_event_description(item), _item_detailed_description_text(item)) if p
-    ).strip()
-
-
-def parse_wati_timeline_for_thread(items: list) -> str:
-    if not isinstance(items, list):
-        return "assigned"
-
-    ts_human_assigned = ""
-    ts_closed = ""
-    ts_bot_reopened = ""
-
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-
-        if _item_event_type(it) != "ticket":
-            continue
-
-        desc = _item_combined_description(it).lower()
-        ts = str(it.get("created") or "")
-
-        # human took control
-        if "assigned to" in desc and "bot" not in desc:
-            if ts > ts_human_assigned:
-                ts_human_assigned = ts
-
-        # human closed
-        if "chat has been closed" in desc or "closed by agent" in desc:
-            if ts > ts_closed:
-                ts_closed = ts
-
-        #  bot took back control
-        if "ticket status" in desc and "open" in desc and "bot" in desc:
-            if ts > ts_bot_reopened:
-                ts_bot_reopened = ts
-
-        if "chat has been initialized" in desc:
-            if ts > ts_bot_reopened:
-                ts_bot_reopened = ts
-
-    latest_end = max(ts_closed, ts_bot_reopened)
-
-    if latest_end and latest_end >= ts_human_assigned:
-        return "resolved"
-
-    return "assigned"
-
-
-async def fetch_wati_get_messages(phone: str) -> dict | None:
-    digits = "".join(c for c in str(phone or "") if c.isdigit())
-    if not digits:
-        return None
-    url = f"{_wati_v1_api_base()}/api/v1/getMessages/{quote(digits, safe='')}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(
-                url,
-                headers={
-                    "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-                    "Accept": "application/json",
-                },
-                params={"pageNumber": 1, "pageSize": 200},
-            )
-            logger.info("WATI getMessages status=%s url=%s", r.status_code, url[:140])
-            if r.status_code >= 400:
-                logger.warning("WATI getMessages body=%s", r.text[:500])
-                return None
-            return r.json()
-    except Exception:
-        logger.exception("WATI getMessages failed")
-        return None
-
-
-async def read_wati_timeline_state(phone: str) -> str | None:
-    """resolved | assigned for techsaathi thread.status sync; None if disabled or request failed."""
-    if not getattr(settings, "WATI_EXT_MESSAGES_ENABLED", True):
-        return None
-    data = await fetch_wati_get_messages(phone)
-    if not isinstance(data, dict):
-        return None
-    res = data.get("result")
-    if res is not None and str(res).lower() not in ("success", "true", "1"):
-        if res is False:
-            logger.warning("WATI getMessages unexpected result=%s", res)
-            return None
-    items = _timeline_items_from_response(data)
-    return parse_wati_timeline_for_thread(items)
-
-
-# =========================================================
-# SEND MESSAGE TO WATI 
-# =========================================================
-async def send_message(phone: str, message: str) -> bool:
-    if not phone:
-        logger.warning("Skipping send_message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Empty message, not sending")
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendSessionMessage/{phone}"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    params={"messageText": text},
-                )
-                logger.info(
-                    "WATI send response status=%s text=%s",
-                    response.status_code,
-                    response.text,
-                )
-                return wati_response_indicates_success(response)
-
-        except httpx.TimeoutException:
-            logger.warning("Timeout attempt %s for %s", attempt, phone)
-            await asyncio.sleep(attempt)
-
-        except Exception as exc:
-            logger.exception("Send failed attempt %s: %s", attempt, exc)
-            await asyncio.sleep(attempt)
-
-    return False
-
-
-async def send_interactive_buttons_message(phone: str, message: str, action: str) -> bool:
-    if not phone:
-        logger.warning("Skipping interactive message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Skipping interactive message: empty body")
-        return False
-
+def _default_button_message(action: str) -> str:
+    #users always see readable caption text with button/list messages when the main LLM doesn’t supply one.
     if action == "mode_buttons":
-        buttons = [
-            {"id": "tech", "title": "Tech Help"},
-            {"id": "scam", "title": "Scam Help"},
-        ]
-    elif action == "feedback_buttons":
-        buttons = [
-            {"id": "resolved", "title": "Resolved "},
-            {"id": "not_resolved", "title": "Still Stuck "},
-        ]
-    else:
-        logger.warning("Unknown interactive action=%s", action)
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendInteractiveButtonsMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "body": text,
-        "footer": "",
-        "buttons": [
-            {
-                "text": button["title"],
-            }
-            for button in buttons
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI interactive response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending interactive buttons action=%s", action)
-        return False
-
-
-async def send_interactive_platform_list_message(phone: str, message: str) -> bool:
-    """WhatsApp list message for supported phone brands (up to 10 rows in one message)."""
-    if not phone:
-        logger.warning("Skipping platform list message: phone missing")
-        return False
-
-    text = (message or "").strip()
-    if not text:
-        logger.warning("Skipping platform list message: empty body")
-        return False
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendInteractiveListMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "header": "Phone brand",
-        "body": text,
-        "footer": "",
-        "buttonText": "Choose phone",
-        "sections": [
-            {
-                "title": "Supported phones",
-                "rows": [
-                    {"title": "Apple", "description": "iPhone / iPad"},
-                    {"title": "Samsung", "description": "Galaxy"},
-                    {"title": "Pixel", "description": "Google Pixel"},
-                    {"title": "Oppo", "description": ""},
-                    {"title": "Xiaomi", "description": "Redmi / POCO"},
-                ],
-            }
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI interactive list response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending interactive platform list message")
-        return False
-
-
-async def send_template_message(phone: str, parameters: list[str] | None = None) -> bool:
-    if not phone:
-        return False
-
-    template_name = getattr(settings, "WATI_TEMPLATE_NAME", "tech_saathi_welcome")
-    payload = {
-        "template_name": template_name,
-        "broadcast_name": "session_start",
-        "parameters": [
-            {"name": f"{{{{{idx + 1}}}}}", "value": value}
-            for idx, value in enumerate(parameters or [])
-        ],
-    }
-    channel_number = getattr(settings, "WATI_CHANNEL_NUMBER", None)
-    if channel_number:
-        payload["channel_number"] = channel_number
-
-    url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendTemplateMessage"
-    headers = {
-        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                url,
-                headers=headers,
-                params={"whatsappNumber": phone},
-                json=payload,
-            )
-            logger.info(
-                "WATI template response status=%s text=%s",
-                response.status_code,
-                response.text,
-            )
-            return wati_response_indicates_success(response)
-    except Exception:
-        logger.exception("Failed sending template message")
-        return False
-
-
-
-def _extract_name(payload: dict) -> str | None:
-    for key in ["senderName", "contactName", "name", "profileName"]:
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()[:512]
-    return None
+        return "How can I help you today?"
+    if action == "platform_buttons":
+        return "Which phone are you using?"
+    if action == "feedback_buttons":
+        return _dynamic_copy("feedback_checkin")
+    return "Please choose an option."
 
 
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
@@ -494,8 +100,7 @@ def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
         phone_number=p_plus or phone,
         first_name=first_name,
         user_type="senior",
-        is_superuser=False,
-        is_staff=False,
+  
     
     )
     db.add(user)
@@ -514,36 +119,47 @@ def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
         user_id=user.id,
         initial=initial,
         dob=date(1970, 1, 1),
-        gender="male",
-        onboarding_type="self",
-        zoom_call=False,
-        whatsapp_call=False,
         whatsapp_msg=True,
-        updates=False,
     )
     db.add(senior)
     db.flush()
-    free_plan = (
-        db.query(SubscriptionPlan)
-        .filter(SubscriptionPlan.plan_type == "free")
-        .first()
-    )
-    if free_plan:
-        existing_subscription = (
-            db.query(Subscription)
-            .filter(Subscription.user_id == senior.id)
+    return senior
+
+
+def _subscription_sync(senior_id: int) -> None:
+    db = SessionLocal()
+    try:
+        free_plan = (
+            db.query(SubscriptionPlan)
+            .filter(SubscriptionPlan.plan_type == "free")
             .first()
         )
-        if not existing_subscription:
-            db.add(
-                Subscription(
-                    user_id=senior.id,
-                    plan_id=free_plan.id,
-                    status="active",
-                )
+        if not free_plan:
+            return
+        existing_subscription = (
+            db.query(Subscription)
+            .filter(Subscription.user_id == senior_id)
+            .first()
+        )
+        if existing_subscription:
+            return
+        db.add(
+            Subscription(
+                user_id=senior_id,
+                plan_id=free_plan.id,
+                status="active",
             )
-            db.flush()
-    return senior
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed creating default subscription for senior_id=%s", senior_id)
+    finally:
+        db.close()
+
+
+def _subscription(senior_id: int) -> None:
+    asyncio.create_task(asyncio.to_thread(_subscription_sync, senior_id))
 
 
 # =========================================================
@@ -612,6 +228,7 @@ def _get_or_create_thread(db, conversation: Conversation, now: datetime):
         or not last_message
         or last_message.created < idle_cutoff
     ):
+        # free_thread_limit(db, conversation.id)
         thread = Thread(
             conversation_id=conversation.id,
             role="chatbot",
@@ -677,6 +294,7 @@ def _persist_incoming(phone: str, message: str, payload: dict):
         message_id = msg.id
 
         db.commit()
+        _subscription(senior.id)
 
         logger.info(
             "Saved message id=%s phone=%s conv=%s wati_conv=%s",
@@ -700,17 +318,17 @@ def _persist_incoming(phone: str, message: str, payload: dict):
 # =========================================================
 # UPDATE BOT RESPONSE
 # =========================================================
-def _update_bot_response(
+
+def _update_bot_response_sync(
     message_id: int,
     bot_response: str | None = None,
     template: str | None = None,
     message_source: str | None = None,
     confidence_score: float | None = None,
-):
+) -> None:
     db = SessionLocal()
     try:
         msg = db.query(Message).filter(Message.id == message_id).first()
-
         if msg:
             if bot_response is not None:
                 msg.bot_response = bot_response
@@ -723,13 +341,30 @@ def _update_bot_response(
             db.commit()
         else:
             logger.warning("Message not found id=%s", message_id)
-
     except Exception:
         db.rollback()
         logger.exception("Failed updating bot_response")
-
     finally:
         db.close()
+
+
+def _update_bot_response(
+    message_id: int,
+    bot_response: str | None = None,
+    template: str | None = None,
+    message_source: str | None = None,
+    confidence_score: float | None = None,
+) -> None:
+    asyncio.create_task(
+        asyncio.to_thread(
+            _update_bot_response_sync,
+            message_id,
+            bot_response,
+            template,
+            message_source,
+            confidence_score,
+        )
+    )
 
 
 def resolve_thread_and_create_new_chatbot_thread(db, thread_id: int) -> int | None:
@@ -740,6 +375,7 @@ def resolve_thread_and_create_new_chatbot_thread(db, thread_id: int) -> int | No
     if thread.role != "chatbot":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     next_thread = Thread(
         conversation_id=thread.conversation_id,
         role="chatbot",
@@ -761,6 +397,7 @@ def resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
     if not thread or thread.role != "chatbot" or thread.status != "assigned":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     human_thread = Thread(
         conversation_id=thread.conversation_id,
         role="techsaathi",
@@ -777,6 +414,7 @@ def resolve_techsaathi_thread_and_create_new_chatbot_thread(db, thread_id: int) 
     if not thread or thread.role != "techsaathi":
         return None
     thread.status = "resolved"
+    # free_thread_limit(db, thread.conversation_id)
     next_thread = Thread(
         conversation_id=thread.conversation_id,
         role="chatbot",
@@ -791,81 +429,6 @@ def _reassign_message_thread(db, message_id: int, new_thread_id: int) -> None:
     msg = db.query(Message).filter(Message.id == message_id).first()
     if msg:
         msg.thread_id = new_thread_id
-
-
-def _extract_button_reply_id(payload: dict | None) -> str | None:
-    raw = payload or {}
-
-    list_reply = raw.get("listReply")
-    if isinstance(list_reply, dict):
-        title = list_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-        reply_id = list_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized
-
-    interactive_button_reply = raw.get("interactiveButtonReply")
-    if isinstance(interactive_button_reply, dict):
-        title = interactive_button_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-            if "resolved" in normalized_title and "stuck" not in normalized_title:
-                return "resolved"
-            if "stuck" in normalized_title or "not resolved" in normalized_title:
-                return "not_resolved"
-        reply_id = interactive_button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"resolved", "not_resolved", "tech", "scam"}:
-                return normalized
-
-    button_reply = raw.get("buttonReply")
-    if isinstance(button_reply, dict):
-        title = button_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
-            if "resolved" in normalized_title and "stuck" not in normalized_title:
-                return "resolved"
-            if "stuck" in normalized_title or "not resolved" in normalized_title:
-                return "not_resolved"
-        reply_id = button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            return reply_id.strip().lower()
-
-    interactive_data = raw.get("interactiveData")
-    if isinstance(interactive_data, dict):
-        button_id = interactive_data.get("buttonId")
-        if isinstance(button_id, str) and button_id.strip():
-            return button_id.strip().lower()
-
-    return None
-
-
-def _default_button_message(action: str) -> str:
-    if action == "mode_buttons":
-        return "How can I help you today?"
-    if action == "platform_buttons":
-        return "Which phone are you using?"
-    if action == "feedback_buttons":
-        return _dynamic_copy("feedback_checkin")
-    return "Please choose an option."
 
 
 def append_human_operator_text_to_latest_message(
@@ -934,6 +497,7 @@ def append_human_operator_text_to_latest_message(
                 if hid:
                     msg.thread_id = hid
             elif thread.role == "chatbot" and thread.status == "resolved":
+                # free_thread_limit(db, thread.conversation_id)
                 human_thread = Thread(
                     conversation_id=thread.conversation_id,
                     role="techsaathi",
@@ -957,119 +521,6 @@ def append_human_operator_text_to_latest_message(
         db.close()
 
 
-async def _send_new_chatbot_thread_mode_prompt(
-    phone: str, conversation_id: int, thread_id: int, message_id: int
-) -> bool:
-    """Send mode buttons when a new chatbot thread starts."""
-    final_welcome_text = _dynamic_copy("welcome_back_context")
-    topic_text = ""
-    db = SessionLocal()
-    try:
-        recent_cutoff = datetime.now(UTC) - timedelta(seconds=60)
-        recent_mode_msg = (
-            db.query(Message)
-            .filter(
-                Message.thread_id == thread_id,
-                Message.id != message_id,
-                Message.is_deleted.is_(False),
-                Message.message_source == "new_thread_reentry",
-                Message.created >= recent_cutoff,
-            )
-            .order_by(desc(Message.created))
-            .first()
-        )
-        if recent_mode_msg:
-            logger.info(
-                "Skipping duplicate new-thread prompt thread_id=%s message_id=%s",
-                thread_id,
-                message_id,
-            )
-            db.commit()
-            return True
-
-        prev_thread = (
-            db.query(Thread)
-            .filter(
-                Thread.conversation_id == conversation_id,
-                Thread.id != thread_id,
-            )
-            .order_by(desc(Thread.created))
-            .first()
-        )
-        if prev_thread:
-            prev_rows = (
-                db.query(Message)
-                .filter(
-                    Message.thread_id == prev_thread.id,
-                    Message.is_deleted.is_(False),
-                )
-                .order_by(desc(Message.created))
-                .limit(5)
-                .all()
-            )
-            prev_rows = list(reversed(prev_rows))
-            previous_turns = []
-            for row in prev_rows:
-                user_text = (row.user_message or "").strip()
-                bot_text = (row.bot_response or "").strip()
-                if user_text:
-                    previous_turns.append({"role": "user", "content": user_text})
-                if bot_text:
-                    previous_turns.append({"role": "assistant", "content": bot_text})
-            topic_text = _dynamic_copy(
-                "thread_topic",
-                context={"previous_turns": previous_turns},
-            )
-            if topic_text:
-                normalized = " ".join(topic_text.split())
-                normalized = re.sub(
-                    r"\b(resolved|fixed|solved|closed|completed|done)\b",
-                    "",
-                    normalized,
-                    flags=re.IGNORECASE,
-                ).strip(" .,-")
-                if len(normalized) > 90:
-                    normalized = normalized[:87].rstrip() + "..."
-                if normalized:
-                    final_welcome_text = _dynamic_copy(
-                        "welcome_back_blended",
-                        context={
-                            "issue_topic": normalized,
-                            "previous_turns": previous_turns,
-                        },
-                    )
-                    # Safety guard: force positive tone even if model outputs negative phrasing.
-                    final_welcome_text = re.sub(
-                        r"\b(not resolved|wasn['’]?t resolved|unresolved|not fixed|didn['’]?t work|failed)\b",
-                        "all good",
-                        final_welcome_text,
-                        flags=re.IGNORECASE,
-                    )
-                    if "how can i help" not in final_welcome_text.lower():
-                        final_welcome_text = f"{final_welcome_text.rstrip(' .')} How can I help you today?"
-        db.commit()
-    except Exception:
-        db.rollback()
-        logger.exception("Failed preparing new-thread personalized welcome")
-    finally:
-        db.close()
-
-    sent_mode = await send_interactive_buttons_message(
-        phone,
-        final_welcome_text,
-        "mode_buttons",
-    )
-    _update_bot_response(
-        message_id,
-        bot_response=final_welcome_text,
-        message_source="new_thread_reentry",
-        confidence_score=None,
-    )
-    if not sent_mode:
-        logger.error("Failed sending new-thread mode buttons to %s", phone)
-    return sent_mode
-
-
 # =========================================================
 # MAIN ENTRYPOINT
 # =========================================================
@@ -1086,6 +537,17 @@ async def process_incoming_message(
         button_reply_id = _extract_button_reply_id(payload)
 
         override = None
+
+        # Block inactive seniors before persisting, so no new conversation/thread/message is created.
+        digits = "".join(c for c in str(phone or "") if c.isdigit())
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+            senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+            if senior and not senior.is_active:
+                return
+        finally:
+            db.close()
 
         # 1. Save incoming message
         message_id, thread_id, conversation_id, _created_new_thread = _persist_incoming(
@@ -1366,6 +828,13 @@ async def process_incoming_message(
                 or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
                 or ""
             ).strip()
+            # ===== switch assignee source to DB  =====
+            # assignee_email = _pick_handoff_assignee_email() or (
+            #     getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
+            #     or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
+            #     or ""
+            # ).strip()
+
             channel_number = (getattr(settings, "WATI_CHANNEL_NUMBER", None) or "").strip()
 
             tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
@@ -1451,7 +920,8 @@ async def process_incoming_message(
             )
             return
 
-        # 2. Send re-entry prompt only when user sends first message in a fresh chatbot thread.
+        # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
+        fresh_chatbot_thread = False
         db = SessionLocal()
         try:
             thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
@@ -1472,7 +942,7 @@ async def process_incoming_message(
                 )
                 .first()
             )
-            should_send_reentry = bool(
+            fresh_chatbot_thread = bool(
                 thread_row
                 and thread_row.role == "chatbot"
                 and not prior_msg_in_same_thread
@@ -1485,15 +955,6 @@ async def process_incoming_message(
         finally:
             db.close()
 
-        if should_send_reentry:
-            await _send_new_chatbot_thread_mode_prompt(
-                phone=phone,
-                conversation_id=conversation_id,
-                thread_id=thread_id,
-                message_id=message_id,
-            )
-            return
-
         # 3. Generate response from history + tool calling
         db = SessionLocal()
         try:
@@ -1501,6 +962,7 @@ async def process_incoming_message(
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
                 "unresolved_rounds": issue_followup_depth,
+                "fresh_chatbot_thread": fresh_chatbot_thread,
             }
             llm_result = override or await generate_wati_reply(
                 db,
@@ -1571,5 +1033,21 @@ async def process_incoming_message(
         if not sent:
             logger.error("Failed sending message to %s", phone)
 
+    # except FreeTierThreadLimitReached:
+    #     upgrade_text = (
+    #         "You have reached your free plan limit. "
+    #         "Please upgrade to continue."
+    #     )
+    #     await send_message(phone, upgrade_text)
+    #     try:
+    #         _update_bot_response(
+    #             message_id,
+    #             bot_response=upgrade_text,
+    #             message_source="free_thread_limit",
+    #             confidence_score=None,
+    #         )
+    #     except Exception:
+    #         pass
+    #     return
     except Exception:
         logger.exception("Processing failed for phone=%s", phone)

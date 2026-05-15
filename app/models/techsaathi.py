@@ -19,6 +19,8 @@ class TechSaathi(BaseModel):
     language = relationship("Language", secondary=tech_saathi_language_association, lazy="dynamic")
     dob = Column(Date, nullable=False)
     gender = Column(GENDER_ENUM, nullable=False, default="male")
+    assigned_count=Column(Integer, default=0)
+
 
     def __str__(self):
         return f"{self.user.first_name} [{self.user.is_active}]"
