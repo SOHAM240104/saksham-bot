@@ -56,7 +56,7 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "welcome_back_blended": (
             "Write ONE short sentence blending: welcome back, hope they are doing okay with the earlier "
             "issue (use issue_topic from context in plain words — no specs, OS versions, or step lists), "
-            "and end by asking how you can help today. Warm and human, not like a support ticket summary."
+            "and close once with 'How can I help you today?' in a warm, human tone — not a ticket recap."
         ),
     }
     fallback = {
