@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger("wati.services.dynamic_copy")
-COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6)
+COPY_LLM = ChatOpenAI(model="gpt-4.1-mini", temperature=0.6, max_tokens=1000)
 
 
 def _load_dynamic_copy_prompt() -> str:
@@ -63,6 +63,13 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
             "Offer phone troubleshooting and ask them to choose their phone brand to continue. "
             "One or two short sentences. Do not mention Tech Help or Scam Help buttons."
         ),
+        "scam_entry": (
+            "User tapped Scam Help with no story yet. Write in clear simple English only "
+            "(not Hindi or Hinglish). Warm WhatsApp opening: reassure they did the right thing "
+            "(use customer_name as '<Name> Ji' when provided). Blank line, then ONE question "
+            "what happened — call, message, payment, link, or app. 2-4 short lines; at most "
+            "one emoji; never blame the victim."
+        ),
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
@@ -76,6 +83,10 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "scam_redirect": (
             "We're still working on the scam-help part. "
             "I can help with phone issues — please choose your phone brand to continue."
+        ),
+        "scam_entry": (
+            "You did exactly the right thing by coming to us.\n\n"
+            "Can you please tell me what happened — was it a call, message, payment, link, or app?"
         ),
     }
     try:

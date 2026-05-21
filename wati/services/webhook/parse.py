@@ -17,6 +17,33 @@ def _extract_name(payload: dict) -> str | None:
     return None
 
 
+def _normalize_support_button_id(
+    reply_id: str | None, title: str | None = None
+) -> str | None:
+    """Map WATI quick-reply ids (often 1/2) and titles to tech/scam."""
+    if isinstance(title, str) and title.strip():
+        normalized_title = title.strip().lower()
+        if "tech help" in normalized_title:
+            return "tech"
+        if "scam help" in normalized_title:
+            return "scam"
+    if not isinstance(reply_id, str) or not reply_id.strip():
+        return None
+    normalized = reply_id.strip().lower()
+    if normalized in {"1", "tech"}:
+        return "tech"
+    if normalized in {"2", "scam"}:
+        return "scam"
+    if normalized in {
+        "resolved",
+        "not_resolved",
+        "tech",
+        "scam",
+    }:
+        return normalized
+    return normalized
+
+
 def _extract_button_reply_id(payload: dict | None) -> str | None:
     raw = payload or {}
 
@@ -38,48 +65,68 @@ def _extract_button_reply_id(payload: dict | None) -> str | None:
         title = interactive_button_reply.get("title")
         if isinstance(title, str) and title.strip():
             normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
             if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
                 return normalized_title
             if "resolved" in normalized_title and "stuck" not in normalized_title:
                 return "resolved"
             if "stuck" in normalized_title or "not resolved" in normalized_title:
                 return "not_resolved"
-        reply_id = interactive_button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"resolved", "not_resolved", "tech", "scam"}:
-                return normalized
+        mapped = _normalize_support_button_id(
+            interactive_button_reply.get("id"),
+            title if isinstance(title, str) else None,
+        )
+        if mapped:
+            return mapped
 
     button_reply = raw.get("buttonReply")
     if isinstance(button_reply, dict):
         title = button_reply.get("title")
         if isinstance(title, str) and title.strip():
             normalized_title = title.strip().lower()
-            if "tech help" in normalized_title:
-                return "tech"
-            if "scam help" in normalized_title:
-                return "scam"
             if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
                 return normalized_title
             if "resolved" in normalized_title and "stuck" not in normalized_title:
                 return "resolved"
             if "stuck" in normalized_title or "not resolved" in normalized_title:
                 return "not_resolved"
-        reply_id = button_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            return reply_id.strip().lower()
+        mapped = _normalize_support_button_id(
+            button_reply.get("id"),
+            title if isinstance(title, str) else None,
+        )
+        if mapped:
+            return mapped
 
     interactive_data = raw.get("interactiveData")
     if isinstance(interactive_data, dict):
         button_id = interactive_data.get("buttonId")
-        if isinstance(button_id, str) and button_id.strip():
-            return button_id.strip().lower()
+        mapped = _normalize_support_button_id(
+            button_id if isinstance(button_id, str) else None,
+            None,
+        )
+        if mapped:
+            return mapped
 
     return None
+
+
+def _is_handoff_confirmation_message(text: str) -> bool:
+    t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not t:
+        return False
+    has_confirm = "yes or no" in t or "reply yes" in t or "please reply yes" in t
+    has_human = any(
+        p in t
+        for p in (
+            "human agent",
+            "human support",
+            "support agent",
+            "connect you",
+            "connect me",
+            "tech saathi",
+        )
+    )
+    return has_confirm and has_human
+
 
 def _handoff_confirm_decision(text: str) -> str:
     msg = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())

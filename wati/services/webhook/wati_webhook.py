@@ -117,7 +117,11 @@ async def send_message(phone: str, message: str) -> bool:
     return False
 
 
-async def send_interactive_buttons_message(phone: str, message: str, action: str) -> bool:
+async def send_interactive_buttons_message(
+    phone: str,
+    message: str,
+    action: str,
+) -> bool:
     if not phone:
         logger.warning("Skipping interactive message: phone missing")
         return False

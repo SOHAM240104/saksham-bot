@@ -11,15 +11,26 @@ from sqlalchemy import desc
 from app.models.chat.chat import Conversation, Message, Thread
 from app.models.senior import Senior
 from app.models.user import User
-from wati.llm.rag_chain import search_support_docs
+from wati.llm.rag_chain import search_scam_kb, search_support_docs
 from wati.services.dynamic_copy import dynamic_copy
+from wati.settings import settings
 
 logger = logging.getLogger("wati.services.conversation")
 MODEL_NAME = "gpt-4.1-mini"
+MAX_OUTPUT_TOKENS = 1000
 SUPPORTED_PLATFORMS = ("apple", "samsung", "pixel", "oppo", "xiaomi")
 # WhatsApp list row titles — whole message must match (case-insensitive) after platform pick.
 PLATFORM_LIST_SELECTION_TOKENS = frozenset(SUPPORTED_PLATFORMS)
 MAX_TOOL_STEPS = 2
+
+_SCAM_ENTRY_TOKENS = frozenset({"scam", "scam help"})
+
+_SCAM_KB_TOOL_PREFIX = (
+    "Use ONLY the knowledge base excerpts below. Do NOT add facts, steps, or warnings "
+    "not present in the excerpts. Use numbered steps as in the excerpts (light paraphrase "
+    "for warmth only).\n\n"
+    "--- KNOWLEDGE BASE EXCERPTS ---\n"
+)
 
 
 @tool("send_mode_buttons")
@@ -46,13 +57,18 @@ def conversation_control(action: str):
     return {"action": (action or "").strip()}
 
 
-CLASSIFIER_LLM = ChatOpenAI(model=MODEL_NAME, temperature=0)
-MAIN_LLM = ChatOpenAI(model=MODEL_NAME, temperature=0).bind_tools(
+CLASSIFIER_LLM = ChatOpenAI(
+    model=MODEL_NAME, temperature=0, max_tokens=MAX_OUTPUT_TOKENS
+)
+MAIN_LLM = ChatOpenAI(
+    model=MODEL_NAME, temperature=0, max_tokens=MAX_OUTPUT_TOKENS
+).bind_tools(
     [
         send_mode_buttons,
         send_platform_buttons,
         send_feedback_buttons,
         search_support_docs,
+        search_scam_kb,
         conversation_control,
     ]
 )
@@ -148,13 +164,21 @@ async def classify_wati_turn_intent(
         "<classification_task>\n"
         "Based on the system policy above, classify latest turn state.\n"
         "Return JSON only with keys:\n"
-        "intent, same_issue_as_previous, is_unresolved_followup, issue_signature, "
+        "intent, active_branch, same_issue_as_previous, is_unresolved_followup, issue_signature, "
         "issue_followup_depth.\n"
-        "Treat short unresolved-negative continuations like 'still stuck', 'not resolved', 'same issue', 'not working', 'didn't work', 'can't figure it out', 'can't do it' (without new technical detail) as is_unresolved_followup=true and same_issue_as_previous=true.\n"
+        "active_branch must be one of: scam, tech, ambiguous — judge from FULL recent_history + latest_user_message (meaning, not keywords).\n"
+        "  scam: fraud/safety thread (OTP, bank, threats, fake apps for theft, parcel/digital arrest, romance, payment) OR assistant already gave scam educate/URGENT/1930/bank help in this thread.\n"
+        "  tech: phone settings, overheating, wallpaper, apps, device how-tos OR assistant gave troubleshooting/platform steps for a device issue.\n"
+        "  ambiguous: greeting-only or unclear; not a clear scam or tech story yet.\n"
+        "is_unresolved_followup=true ONLY for tech troubleshooting (still stuck / not working on phone issue) — always false when active_branch is scam.\n"
+        "Treat short unresolved-negative continuations like 'still stuck', 'not resolved', 'same issue', 'not working', 'didn't work' (tech phone issues only) as is_unresolved_followup=true.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
+        "intent RESOLVED only when the user clearly ends the CURRENT help arc (thanks, all done, sorted, bye) — NOT for scam mid-flow replies like bank name, 'no I didn't', 'done' after 1930 offer, or 'what now'.\n"
+        "When active_branch is scam and scam help is still in progress → intent must be OTHER (never RESOLVED).\n"
+        "When user asks for human/agent → intent REQUEST_HUMAN.\n"
         "issue_signature must be short snake_case.\n"
         "issue_followup_depth must be integer >= 1.\n"
-        "For SAME ISSUE unresolved flow, escalation threshold is depth 3.\n"
+        "For tech SAME ISSUE unresolved flow only, escalation threshold is depth 3.\n"
         "If latest turn is a NEW issue/topic switch, set same_issue_as_previous=false and issue_followup_depth=1.\n"
         "No prose, no markdown.\n"
         "</classification_task>"
@@ -199,9 +223,18 @@ async def classify_wati_turn_intent(
         issue_followup_depth = 1
     if issue_followup_depth < 1:
         issue_followup_depth = 1
-    
+
+    active_branch = str(parsed.get("active_branch") or "").strip().lower()
+    if active_branch not in {"scam", "tech", "ambiguous"}:
+        active_branch = "ambiguous"
+    if active_branch == "scam" and intent == "RESOLVED":
+        intent = "OTHER"
+    if active_branch == "scam":
+        unresolved_followup = False
+
     return {
         "intent": intent,
+        "active_branch": active_branch,
         "same_issue_as_previous": same_issue,
         "is_unresolved_followup": unresolved_followup,
         "issue_signature": issue_signature,
@@ -219,16 +252,201 @@ def _user_chose_scam_support(text: str) -> bool:
     return t in {"scam", "scam help"}
 
 
-def _is_scam_help_turn(message: str, button_reply_id: str) -> bool:
-    return (button_reply_id or "").strip().lower() == "scam" or _user_chose_scam_support(message)
+def _coerce_bool_field(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
 
 
-def _should_block_scam_retrieval(support_mode: str, message: str, button_reply_id: str) -> bool:
-    if (support_mode or "").strip().lower() != "scam":
+_BRANCH_CHANGE_SHORT_REPLIES = frozenset(
+    {"yes", "y", "yeah", "yep", "ha", "haan", "han", "ji", "ok", "okay", "sure", "no", "n", "nope", "nah", "nahi", "na", "not now", "continue"}
+)
+_SWITCH_YES = frozenset(
+    {"yes", "y", "yeah", "yep", "ha", "haan", "han", "ji", "ok", "okay", "sure"}
+)
+_SWITCH_NO = frozenset(
+    {"no", "n", "nope", "nah", "nahi", "na", "not now", "continue"}
+)
+
+
+def _user_switch_reply(text: str) -> str | None:
+    t = (text or "").strip().lower().rstrip(".!? ")
+    if t in _SWITCH_YES:
+        return "yes"
+    if t in _SWITCH_NO:
+        return "no"
+    return None
+
+
+def _assistant_offered_branch_change(history: list[dict], target: str) -> bool:
+    """True if the last assistant turn offered to change tech vs scam branch (plain text)."""
+    target = (target or "").strip().lower()
+    for item in reversed(history[:-1]):
+        if item.get("role") != "assistant":
+            continue
+        content = (item.get("content") or "").lower()
+        offered = (
+            "yes or no" in content
+            or "reply yes" in content
+            or "if yes" in content
+            or "please confirm" in content
+            or "would you like" in content
+            or "do you want" in content
+            or "shall we" in content
+            or "or continue" in content
+            or "or stay" in content
+            or "switch to" in content
+            or "stay on" in content
+        )
+        if not offered:
+            return False
+        if target == "scam":
+            return "scam" in content
+        if target == "tech":
+            return "tech" in content or "phone" in content
         return False
-    if _is_scam_help_turn(message, button_reply_id):
+    return False
+
+
+def _is_branch_change_short_reply(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip(".!? ")
+    return t in _BRANCH_CHANGE_SHORT_REPLIES
+
+
+def resolve_scam_context_from_turn(
+    history: list[dict],
+    current_message: str,
+    button_reply_id: str = "",
+    support_mode: str | None = None,
+    intent_result: dict | None = None,
+) -> tuple[str, bool]:
+    """Return (support_mode, scam_mode). Prompt-led branch via classifier + explicit taps."""
+    intent_result = intent_result or {}
+    branch = (intent_result.get("active_branch") or "").strip().lower()
+    mode = (support_mode or "").strip().lower() or _infer_support_mode(history)
+    btn = (button_reply_id or "").strip().lower()
+    msg = (current_message or "").strip()
+    switch = _user_switch_reply(msg)
+
+    if _user_chose_tech_support(msg) or btn == "tech":
+        mode = "tech"
+    elif btn == "scam" or _user_chose_scam_support(msg):
+        mode = "scam"
+    elif switch == "yes" and _assistant_offered_branch_change(history, "scam"):
+        mode = "scam"
+    elif switch == "yes" and _assistant_offered_branch_change(history, "tech"):
+        mode = "tech"
+    elif switch == "no":
+        prior = _infer_support_mode(history)
+        if prior:
+            mode = prior
+    elif branch in {"scam", "tech"}:
+        mode = branch
+
+    return mode, mode == "scam"
+
+
+def _effective_scam_path(
+    scam_mode: bool,
+    *,
+    had_search_scam: bool = False,
+    button_reply_id: str = "",
+) -> bool:
+    btn = (button_reply_id or "").strip().lower()
+    if scam_mode or had_search_scam:
         return True
-    return _is_platform_list_selection_only(message)
+    return btn == "scam"
+
+
+def _pending_user_issue_from_history(
+    history: list[dict],
+    current_message: str,
+    button_reply_id: str = "",
+) -> str:
+    """Last substantive user message before a branch-change reply (for tech/scam handoff)."""
+    btn = (button_reply_id or "").strip().lower()
+    skip_current = _is_branch_change_short_reply(current_message) or _user_switch_reply(current_message)
+    for item in reversed(history):
+        if item.get("role") != "user":
+            continue
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if skip_current and content == (current_message or "").strip():
+            skip_current = False
+            continue
+        if _is_scam_entry_message(content) or _user_chose_tech_support(content):
+            continue
+        if _user_switch_reply(content) or len(content) < 12:
+            continue
+        return content[:500]
+    current = (current_message or "").strip()
+    if (
+        current
+        and not _is_branch_change_short_reply(current)
+        and not _user_switch_reply(current)
+        and len(current) >= 12
+        and not _is_scam_entry_message(current)
+    ):
+        return current[:500]
+    return ""
+
+
+def _fallback_reply_text(on_scam_path: bool) -> str:
+    if on_scam_path:
+        return (
+            "Could you tell me a bit more about what happened, "
+            "so I can guide you better?"
+        )
+    return "Could you share a little more detail about the issue?"
+
+
+def _is_scam_entry_message(text: str, button_reply_id: str = "") -> bool:
+    t = (text or "").strip().lower().rstrip(".!? ")
+    btn = (button_reply_id or "").strip().lower()
+    return btn == "scam" or t in _SCAM_ENTRY_TOKENS
+
+
+def _user_has_described_scam_situation(
+    history: list[dict],
+    current_message: str,
+    button_reply_id: str = "",
+) -> bool:
+    """True when the user has given enough context beyond a bare Scam Help tap."""
+    current = (current_message or "").strip()
+    if current and not _is_scam_entry_message(current, button_reply_id) and len(current) >= 20:
+        return True
+    for item in history:
+        if item.get("role") != "user":
+            continue
+        content = (item.get("content") or "").strip()
+        if content and not _is_scam_entry_message(content) and len(content) >= 20:
+            return True
+    return False
+
+
+def _format_scam_kb_tool_message(context: str) -> str:
+    body = (context or "").strip()
+    if not body:
+        return (
+            f"{_SCAM_KB_TOOL_PREFIX}"
+            "(no excerpts — tell the user you lack detailed material; suggest 1930; do not invent scam details.)"
+        )
+    return f"{_SCAM_KB_TOOL_PREFIX}{body}\n--- END EXCERPTS ---"
+
+
+def _scam_text_reply(message: str, retrieval_sources: list[str] | None = None) -> dict:
+    sources = [s for s in (retrieval_sources or []) if str(s).strip()]
+    message_source = "scam_flow"
+    if sources:
+        message_source = "scam_flow," + ",".join(sources)
+    return {
+        "kind": "text",
+        "message": (message or "").strip(),
+        "message_source": message_source,
+    }
 
 
 def _is_platform_list_selection_only(text: str) -> bool:
@@ -514,16 +732,28 @@ async def generate_wati_reply(
     history = history or _build_history_messages(db, thread_id, current_message_id, current_message)
     runtime_context = _infer_runtime_context(history)
     customer_name = _name_for_thread(db, thread_id)
-    support_mode = _infer_support_mode(history)
     turn_meta = turn_meta or {}
+    button_reply_id = (turn_meta.get("button_reply_id") or "").strip().lower()
+    support_mode, scam_mode = resolve_scam_context_from_turn(
+        history,
+        current_message,
+        button_reply_id,
+        intent_result={
+            "active_branch": (turn_meta.get("active_branch") or "").strip().lower(),
+        },
+    )
     runtime_context["unresolved_signal_current_turn"] = bool(
         turn_meta.get("unresolved_signal_current_turn")
     )
     runtime_context["unresolved_rounds"] = int(turn_meta.get("unresolved_rounds") or 0)
+    if scam_mode:
+        runtime_context["unresolved_signal_current_turn"] = False
+        runtime_context["unresolved_rounds"] = 0
     runtime_context["button_reply_id"] = (
         str(turn_meta.get("button_reply_id") or "").strip().lower()
     )
     fresh_chatbot_thread = bool(turn_meta.get("fresh_chatbot_thread"))
+    post_resolve_welcome_sent = bool(turn_meta.get("post_resolve_welcome_sent"))
     prior_issue_topic = ""
     prior_thread_summary = ""
     prior_turns_snippet = ""
@@ -535,28 +765,10 @@ async def generate_wati_reply(
         prior_turns_snippet = snap.get("prior_turns_snippet") or ""
         prior_welcome_blend = snap.get("prior_welcome_blend") or ""
 
-    button_reply_id = (turn_meta.get("button_reply_id") or "").strip().lower()
-
-    if _is_scam_help_turn(current_message, button_reply_id):
-        scam_msg = dynamic_copy(
-            "scam_redirect",
-            context={"customer_name": customer_name or ""},
-        ).strip()
-        return {
-            "kind": "action",
-            "action": "platform_buttons",
-            "message": scam_msg,
-            "message_source": "scam_unavailable",
-        }
-
-    if support_mode == "scam" and _is_platform_list_selection_only(current_message):
-        slug = _infer_platform(current_message)
-        if slug in SUPPORTED_PLATFORMS:
-            return {
-                "kind": "text",
-                "message": _issue_prompt_for_platform(slug),
-                "message_source": "scam_unavailable",
-            }
+    bank_helpline_url = (settings.BANK_HELPLINE_URL or "").strip()
+    pending_user_issue = _pending_user_issue_from_history(
+        history, current_message, button_reply_id
+    )
 
     if support_mode == "tech" and _is_platform_list_selection_only(current_message):
         slug = _infer_platform(current_message)
@@ -567,6 +779,19 @@ async def generate_wati_reply(
                 "message_source": "",
             }
 
+    if scam_mode and not _user_has_described_scam_situation(
+        history, current_message, button_reply_id
+    ) and _is_scam_entry_message(current_message, button_reply_id):
+        entry_text = dynamic_copy(
+            "scam_entry",
+            context={"customer_name": (customer_name or "").strip()},
+        )
+        return {
+            "kind": "text",
+            "message": entry_text,
+            "message_source": "scam_entry,dynamic_copy",
+        }
+
     messages = _to_langchain_messages(history)
     messages.insert(
         1,
@@ -574,6 +799,7 @@ async def generate_wati_reply(
             content=(
                 "<runtime_context>\n"
                 f"fresh_chatbot_thread: {fresh_chatbot_thread}\n"
+                f"post_resolve_welcome_sent: {str(post_resolve_welcome_sent).lower()}\n"
                 f"prior_welcome_blend: {prior_welcome_blend or 'none'}\n"
                 f"prior_issue_topic: {prior_issue_topic or 'none'}\n"
                 f"prior_thread_summary: {prior_thread_summary or 'none'}\n"
@@ -586,14 +812,33 @@ async def generate_wati_reply(
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
-                "When fresh_chatbot_thread is true: use prior_welcome_blend verbatim in send_mode_buttons when not none — do not append a second help/assist closing.\n"
-                "When unresolved_signal_current_turn is true and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
+                f"bank_helpline_url: {bank_helpline_url or 'none'}\n"
+                f"scam_mode_active: {str(scam_mode).lower()}\n"
+                f"active_branch: {(turn_meta.get('active_branch') or support_mode or 'infer_from_history')}\n"
+                f"pending_user_issue: {pending_user_issue or 'none'}\n"
+                "Routing (tech vs scam) is YOUR job via <routing_intelligence> and RULE 0 — read full history every turn.\n"
+                "support_mode / scam_mode_active / active_branch are hints only — if history clearly shows scam safety, follow RULE 0 even when flags were false on a typed-first message.\n"
+                "Never close a scam crisis with a generic 'glad everything is working' line; never send platform_buttons mid-scam.\n"
+                "Mid-conversation branch change (tech ↔ scam): plain text only — ask warmly if they want scam safety or phone help; yes/no or their next message confirms the branch.\n"
+                "After user confirms switching branch: help immediately using pending_user_issue and history — do not re-ask the same question.\n"
+                "Infer from history whether the user confirmed money sent or OTP/password/bank details shared; only then use URGENT/SECTION E bank-block steps.\n"
+                "FIRST URGENT after OTP/credentials: Step 1 = call bank to block only — NO bank phone number unless user already named that bank in history; never default to HDFC. Closing must offer helpline when they reply with bank name.\n"
+                "Bank helpline follow-up: when user names a bank or asks for number → one line from scam_reference_numbers only; no 1930/complaint in same turn.\n"
+                "When on scam path: plain text only; no send_mode_buttons, send_platform_buttons, send_feedback_buttons, or search_support_docs.\n"
+                "Scam Help tap only (no situation described yet): handled by dynamic entry copy — not your turn.\n"
+                "When the user has described their situation: MUST call search_scam_kb first, then <scam_unified_flow> (comfort → category → MO; contextual check — not always money/OTP).\n"
+                "Complaint (1930): plain text REPORT/HOW TO FILE only; end with one warm natural line offering prevention tips (no 'reply yes'). If user clearly wants tips: search_scam_kb(prevention) then PREVENTION in plain text.\n"
+                "Never repeat prior-thread welcome-back text when entering scam help or when the user already described a scam in this thread.\n"
+                "When on scam path and user clearly thanks or says resolved: conversation_control(resolved) + warm close — no mode buttons.\n"
+                "When on scam path and user asks for human: RULE 7b — brief acknowledgment only.\n"
+                "When fresh_chatbot_thread is true and post_resolve_welcome_sent is true: system already sent prior_welcome_blend + Tech/Scam buttons — do NOT send_mode_buttons or repeat welcome on greeting-only.\n"
+                "When fresh_chatbot_thread is true and post_resolve_welcome_sent is false and greeting-only: prior_welcome_blend may be used in send_mode_buttons (human handoff return).\n"
+                "When unresolved_signal_current_turn is true and support_mode is not scam and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
                 "In that gate: ask exactly one follow-up diagnostic question; do not call search_support_docs; do not call send_feedback_buttons; do not provide troubleshooting steps in this turn.\n"
                 "Ask platform-specific refinement first when missing (Apple: iOS/iPadOS, Samsung: model, Pixel: Android, Oppo: ColorOS, Xiaomi: HyperOS/Android), then wait for user reply.\n"
                 "For Oppo unresolved follow-ups, do not ask phone model; ask ColorOS version first.\n"
                 "If latest user message includes concrete new technical detail, still ask one high-value refinement question first and wait for user reply before retrieval.\n"
                 "If latest user message contains an unsupported phone brand, respond in plain text with supported brands and one continuation question; do not call send_platform_buttons.\n"
-                "Scam Help (button_reply_id scam): handled in code with scam_redirect + platform_buttons only — no send_mode_buttons, no scam retrieval.\n"
                 "</runtime_context>"
             )
         ),
@@ -601,14 +846,38 @@ async def generate_wati_reply(
     retrieval_sources: list[str] = []
     retrieval_confidence = 0.0
     had_search_support_this_turn = False
+    had_search_scam_this_turn = False
+    on_scam_path = scam_mode
 
     for _ in range(MAX_TOOL_STEPS):
+        on_scam_path = _effective_scam_path(
+            scam_mode,
+            had_search_scam=had_search_scam_this_turn,
+            button_reply_id=button_reply_id,
+        )
         ai_message = MAIN_LLM.invoke(messages)
         tool_calls = getattr(ai_message, "tool_calls", None) or []
 
         if not tool_calls:
             text = (getattr(ai_message, "content", "") or "").strip()
-            if had_search_support_this_turn and text and _looks_like_troubleshooting_steps(text):
+            if not text:
+                fallback = _fallback_reply_text(on_scam_path)
+                if on_scam_path:
+                    return _scam_text_reply(
+                        fallback,
+                        retrieval_sources if had_search_scam_this_turn else None,
+                    )
+                return {
+                    "kind": "text",
+                    "message": fallback,
+                    "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                }
+            if (
+                not on_scam_path
+                and had_search_support_this_turn
+                and text
+                and _looks_like_troubleshooting_steps(text)
+            ):
                 return {
                     "kind": "action",
                     "action": "feedback_buttons",
@@ -616,6 +885,8 @@ async def generate_wati_reply(
                     "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                     "confidence_score": retrieval_confidence,
                 }
+            if on_scam_path:
+                return _scam_text_reply(text, retrieval_sources if had_search_scam_this_turn else None)
             return {
                 "kind": "text",
                 "message": text,
@@ -632,14 +903,12 @@ async def generate_wati_reply(
             tool_call_id = tool_call.get("id", "tool-call")
 
             if tool_name == "search_support_docs":
-                if _should_block_scam_retrieval(
-                    support_mode, current_message, button_reply_id
-                ):
+                if on_scam_path:
                     messages.append(
                         ToolMessage(
                             content=(
-                                "Scam support is still being built. Do not retrieve scam playbook. "
-                                "Ask what phone issue the user needs help with (plain text only)."
+                                "User is on the scam safety path. Do not call search_support_docs. "
+                                "Reply in plain text following RULE 0 and <scam_unified_flow>."
                             ),
                             tool_call_id=tool_call_id,
                             name="search_support_docs",
@@ -664,6 +933,15 @@ async def generate_wati_reply(
                 if not str(args.get("os_version") or "").strip() and retrieval_version:
                     args["os_version"] = retrieval_version
                 base_query = str(args.get("user_query") or current_message or "").strip()
+                if (
+                    (
+                        _is_branch_change_short_reply(current_message)
+                        or _user_switch_reply(current_message)
+                    )
+                    and pending_user_issue
+                    and (not base_query or len(base_query) < 12)
+                ):
+                    base_query = pending_user_issue
                 hint_lines = []
                 if retrieval_os:
                     hint_lines.append(f"os_family: {retrieval_os}")
@@ -699,18 +977,68 @@ async def generate_wati_reply(
                 had_search_support_this_turn = True
                 continue
 
+            if tool_name == "search_scam_kb":
+                if not _user_has_described_scam_situation(history, current_message, button_reply_id):
+                    messages.append(
+                        ToolMessage(
+                            content=(
+                                "User has not described their situation yet. Reassure warmly and ask "
+                                "what happened (one short question). Do not retrieve until they explain."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name="search_scam_kb",
+                        )
+                    )
+                    continue
+                query = str(args.get("user_query") or current_message or "").strip()
+                if not query or len(query) < 15:
+                    parts = []
+                    for item in history:
+                        if item.get("role") == "user":
+                            c = (item.get("content") or "").strip()
+                            if c and not _is_scam_entry_message(c):
+                                parts.append(c)
+                    if (current_message or "").strip() and not _is_scam_entry_message(
+                        current_message, button_reply_id
+                    ):
+                        parts.append((current_message or "").strip())
+                    query = " ".join(parts[-4:]) or query
+                try:
+                    result = search_scam_kb.invoke({"user_query": query})
+                except Exception:
+                    logger.exception("search_scam_kb invocation failed")
+                    messages.append(
+                        ToolMessage(
+                            content=_format_scam_kb_tool_message(""),
+                            tool_call_id=tool_call_id,
+                            name="search_scam_kb",
+                        )
+                    )
+                    continue
+                messages.append(
+                    ToolMessage(
+                        content=_format_scam_kb_tool_message(result.get("context", "") or ""),
+                        tool_call_id=tool_call_id,
+                        name="search_scam_kb",
+                    )
+                )
+                sources = result.get("sources") or []
+                if isinstance(sources, list):
+                    retrieval_sources = [str(item) for item in sources if str(item).strip()]
+                confidence = result.get("confidence_score")
+                if isinstance(confidence, (int, float)):
+                    retrieval_confidence = float(confidence)
+                search_tool_used = True
+                had_search_scam_this_turn = True
+                on_scam_path = True
+                continue
+
             if tool_name == "send_mode_buttons":
-                if (support_mode or "").strip().lower() == "scam":
-                    scam_msg = dynamic_copy(
-                        "scam_redirect",
-                        context={"customer_name": customer_name or ""},
-                    ).strip()
-                    return {
-                        "kind": "action",
-                        "action": "platform_buttons",
-                        "message": scam_msg or (args.get("message") or "").strip(),
-                        "message_source": "scam_unavailable",
-                    }
+                if on_scam_path:
+                    return _scam_text_reply(
+                        args.get("message") or "",
+                        retrieval_sources if had_search_scam_this_turn else None,
+                    )
                 return {
                     "kind": "action",
                     "action": "mode_buttons",
@@ -719,6 +1047,11 @@ async def generate_wati_reply(
                 }
 
             if tool_name == "send_platform_buttons":
+                if on_scam_path:
+                    return _scam_text_reply(
+                        args.get("message") or "",
+                        retrieval_sources if had_search_scam_this_turn else None,
+                    )
                 msg = (args.get("message") or "").strip()
                 known_platform = (runtime_context.get("known_platform") or "").strip().lower()
                 if known_platform in SUPPORTED_PLATFORMS:
@@ -735,6 +1068,11 @@ async def generate_wati_reply(
                 }
 
             if tool_name == "send_feedback_buttons":
+                if on_scam_path:
+                    return _scam_text_reply(
+                        args.get("message") or "",
+                        retrieval_sources if had_search_scam_this_turn else None,
+                    )
                 msg = (args.get("message") or "").strip()
                 if not _looks_like_troubleshooting_steps(msg):
                     return {
@@ -759,7 +1097,12 @@ async def generate_wati_reply(
             continue
 
         text = (getattr(ai_message, "content", "") or "").strip()
-        if had_search_support_this_turn and text and _looks_like_troubleshooting_steps(text):
+        if (
+            not on_scam_path
+            and had_search_support_this_turn
+            and text
+            and _looks_like_troubleshooting_steps(text)
+        ):
             return {
                 "kind": "action",
                 "action": "feedback_buttons",
@@ -767,14 +1110,27 @@ async def generate_wati_reply(
                 "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                 "confidence_score": retrieval_confidence,
             }
+        if on_scam_path and text:
+            return _scam_text_reply(
+                text,
+                retrieval_sources if had_search_scam_this_turn else None,
+            )
+        if not text:
+            text = _fallback_reply_text(on_scam_path)
         return {
             "kind": "text",
             "message": text,
             "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
         }
 
+    fallback = _fallback_reply_text(on_scam_path)
+    if on_scam_path:
+        return _scam_text_reply(
+            fallback,
+            retrieval_sources if had_search_scam_this_turn else None,
+        )
     return {
         "kind": "text",
-        "message": "Could you share a little more detail about the issue?",
+        "message": fallback,
         "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
     }

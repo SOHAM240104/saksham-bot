@@ -13,9 +13,11 @@ from app.models.subscriptions import Subscription, SubscriptionPlan
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
+    _prior_thread_snapshot,
     classify_wati_turn_intent,
     conversation_control,
     generate_wati_reply,
+    resolve_scam_context_from_turn,
 )
 from wati.services.dynamic_copy import dynamic_copy as _dynamic_copy
 from wati.settings import settings
@@ -24,6 +26,7 @@ from .parse import (
     _extract_button_reply_id,
     _extract_name,
     _handoff_confirm_decision,
+    _is_handoff_confirmation_message,
     wati_payload_indicates_human_operator,
 )
 # Free-tier thread limit (disabled )
@@ -577,6 +580,7 @@ async def process_incoming_message(
         finally:
             db.close()
 
+        intent_result: dict = {}
         should_run_classifier = bool(incoming_message.strip()) or bool(button_reply_id)
         if should_run_classifier:
             db = SessionLocal()
@@ -605,13 +609,31 @@ async def process_incoming_message(
             if issue_followup_depth < 1:
                 issue_followup_depth = 1
             logger.info(
-                "LLM_INTENT intent=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
+                "LLM_INTENT intent=%s active_branch=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
                 classified_intent,
+                intent_result.get("active_branch"),
                 phone,
                 same_issue_as_previous,
                 is_unresolved_followup,
                 issue_followup_depth,
             )
+
+        support_mode, scam_context = resolve_scam_context_from_turn(
+            history_for_llm or [],
+            incoming_message,
+            button_reply_id or "",
+            intent_result=intent_result,
+        )
+        logger.info(
+            "ROUTE_CONTEXT phone=%s button=%s support_mode=%s active_branch=%s scam_context=%s msg_preview=%s",
+            phone,
+            (button_reply_id or "")[:16],
+            support_mode,
+            (intent_result.get("active_branch") or ""),
+            scam_context,
+            (incoming_message or "")[:80],
+        )
+
         # Deterministic signal for unresolved button taps.
         # Button input is an explicit unresolved follow-up on current issue.
         if button_reply_id == "not_resolved":
@@ -631,7 +653,11 @@ async def process_incoming_message(
                 .first()
             )
             awaiting_handoff_confirm = bool(
-                last_msg and (last_msg.message_source or "").strip() == "handoff_confirmation"
+                last_msg
+                and (
+                    (last_msg.message_source or "").strip() == "handoff_confirmation"
+                    or _is_handoff_confirmation_message(last_msg.bot_response or "")
+                )
             )
             db.commit()
         except Exception:
@@ -643,15 +669,21 @@ async def process_incoming_message(
             confirm_reply = _handoff_confirm_decision(incoming_message)
             declined_handoff = confirm_reply == "NO"
         is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
+        if scam_context:
+            is_unresolved = False
+            issue_followup_depth = 1
 
         if classified_intent == "RESOLVED":
-            control_result = conversation_control.invoke({"action": "resolved"})
-            override = {
-                "kind": "control",
-                "action": (control_result.get("action") or "").strip(),
-                "message_source": "intent_classifier",
-                "confidence_score": None,
-            }
+            # On scam path, only the main LLM closes via conversation_control (RULE 0).
+            allow_resolve = not scam_context
+            if allow_resolve:
+                control_result = conversation_control.invoke({"action": "resolved"})
+                override = {
+                    "kind": "control",
+                    "action": (control_result.get("action") or "").strip(),
+                    "message_source": "intent_classifier",
+                    "confidence_score": None,
+                }
 
         # --- Human ticket resolved (WATI UI) ---
         ticket_raw = str(payload.get("ticketStatus") or payload.get("ticket_status") or "").strip().upper()
@@ -780,7 +812,8 @@ async def process_incoming_message(
                 ):
                     ask_handoff_confirmation = True
                 elif (
-                    same_issue_as_previous
+                    not scam_context
+                    and same_issue_as_previous
                     and is_unresolved
                     and issue_followup_depth >= 3
                 ):
@@ -922,6 +955,7 @@ async def process_incoming_message(
 
         # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
         fresh_chatbot_thread = False
+        post_resolve_welcome_sent = False
         db = SessionLocal()
         try:
             thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
@@ -948,6 +982,30 @@ async def process_incoming_message(
                 and not prior_msg_in_same_thread
                 and prior_thread_exists
             )
+            if fresh_chatbot_thread:
+                prev_thread = (
+                    db.query(Thread)
+                    .filter(
+                        Thread.conversation_id == conversation_id,
+                        Thread.id != thread_id,
+                    )
+                    .order_by(desc(Thread.created))
+                    .first()
+                )
+                if prev_thread:
+                    last_on_prev = (
+                        db.query(Message)
+                        .filter(
+                            Message.thread_id == prev_thread.id,
+                            Message.is_deleted.is_(False),
+                        )
+                        .order_by(desc(Message.created))
+                        .first()
+                    )
+                    if last_on_prev and "post_resolve_welcome" in (
+                        last_on_prev.message_source or ""
+                    ):
+                        post_resolve_welcome_sent = True
             db.commit()
         except Exception:
             db.rollback()
@@ -963,6 +1021,9 @@ async def process_incoming_message(
                 "unresolved_signal_current_turn": is_unresolved,
                 "unresolved_rounds": issue_followup_depth,
                 "fresh_chatbot_thread": fresh_chatbot_thread,
+                "post_resolve_welcome_sent": post_resolve_welcome_sent,
+                "active_branch": (intent_result.get("active_branch") or "").strip().lower(),
+                "classifier_intent": (intent_result.get("intent") or "").strip().upper(),
             }
             llm_result = override or await generate_wati_reply(
                 db,
@@ -990,6 +1051,7 @@ async def process_incoming_message(
         if llm_result.get("kind") == "control":
             control_action = (llm_result.get("action") or "").strip().lower()
             if control_action == "resolved":
+                new_thread_id = None
                 db = SessionLocal()
                 try:
                     new_thread_id = resolve_thread_and_create_new_chatbot_thread(
@@ -1005,11 +1067,45 @@ async def process_incoming_message(
                 ack_text = _dynamic_copy("resolved_ack")
                 sent = await send_message(phone, ack_text)
                 bot_response = ack_text
-                if not response_source:
-                    response_source = "conversation_control"
+                response_source = "conversation_control"
+
+                welcome_text = _default_button_message("mode_buttons")
+                if new_thread_id:
+                    db = SessionLocal()
+                    try:
+                        snap = _prior_thread_snapshot(db, new_thread_id)
+                        welcome_text = (
+                            (snap.get("prior_welcome_blend") or "").strip()
+                            or welcome_text
+                        )
+                    finally:
+                        db.close()
+
+                sent_buttons = await send_interactive_buttons_message(
+                    phone, welcome_text, "mode_buttons"
+                )
+                sent = sent or sent_buttons
+                bot_response = f"{ack_text}\n\n---\n\n{welcome_text}"
+                response_source = "conversation_control,post_resolve_welcome,mode_buttons"
             else:
                 sent = True
                 bot_response = ""
+        elif llm_result.get("kind") == "multi_text":
+            parts = llm_result.get("messages") or []
+            bot_chunks: list[str] = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                text = (part.get("message") or "").strip()
+                if not text:
+                    continue
+                part_sent = await send_message(phone, text)
+                sent = sent or part_sent
+                bot_chunks.append(text)
+                part_source = (part.get("message_source") or "").strip()
+                if part_source and not response_source:
+                    response_source = part_source
+            bot_response = "\n\n---\n\n".join(bot_chunks)
         elif llm_result.get("kind") == "action":
             action = llm_result.get("action")
             action_message = (llm_result.get("message") or "").strip() or _default_button_message(action)

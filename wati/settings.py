@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     WATI_CHANNEL_NUMBER: str = "919999043434"
     # When thread is human (techsaathi), poll ext v3 GET …/messages to detect agent-closed chat
     WATI_EXT_MESSAGES_ENABLED: bool = True
+    BANK_HELPLINE_URL: str = ""
 
     if _PYDANTIC_V2:
         model_config = SettingsConfigDict(
