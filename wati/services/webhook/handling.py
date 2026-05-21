@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import UTC, date, datetime, timedelta
@@ -32,11 +33,13 @@ from .parse import (
 # Free-tier thread limit (disabled )
 # from .feature import FreeTierThreadLimitReached, free_thread_limit
 from .wati_webhook import (
+    keep_typing_indicator,
     read_wati_timeline_state,
     send_interactive_buttons_message,
     send_interactive_platform_list_message,
     send_message,
     send_template_message,
+    send_typing_indicator,
 )
 
 logger = logging.getLogger("wati.services.handling")
@@ -89,6 +92,74 @@ def _default_button_message(action: str) -> str:
     if action == "feedback_buttons":
         return _dynamic_copy("feedback_checkin")
     return "Please choose an option."
+
+
+def _classify_wati_turn_intent_in_thread(
+    thread_id: int,
+    message_id: int,
+    incoming_message: str,
+    payload: dict,
+    button_reply_id: str | None,
+    history_for_llm: list[dict] | None,
+) -> dict:
+    db = SessionLocal()
+    try:
+        result = asyncio.run(
+            classify_wati_turn_intent(
+                db,
+                thread_id=thread_id,
+                current_message_id=message_id,
+                current_message=incoming_message,
+                payload=payload,
+                button_reply_id=button_reply_id,
+                history=history_for_llm,
+            )
+        )
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _generate_wati_reply_in_thread(
+    thread_id: int,
+    message_id: int,
+    incoming_message: str,
+    turn_meta: dict,
+    history_for_llm: list[dict] | None,
+) -> dict:
+    db = SessionLocal()
+    try:
+        result = asyncio.run(
+            generate_wati_reply(
+                db,
+                thread_id,
+                message_id,
+                incoming_message,
+                turn_meta=turn_meta,
+                history=history_for_llm,
+            )
+        )
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+async def _stop_typing_indicator(
+    typing_stop: asyncio.Event,
+    typing_task: asyncio.Task,
+) -> None:
+    typing_stop.set()
+    typing_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await typing_task
 
 
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
@@ -580,19 +651,80 @@ async def process_incoming_message(
         finally:
             db.close()
 
-        intent_result: dict = {}
-        should_run_classifier = bool(incoming_message.strip()) or bool(button_reply_id)
-        if should_run_classifier:
+        typing_stop = asyncio.Event()
+        typing_task = asyncio.create_task(keep_typing_indicator(phone, typing_stop))
+        await send_typing_indicator(phone)
+        try:
+            intent_result: dict = {}
+            should_run_classifier = bool(incoming_message.strip()) or bool(button_reply_id)
+            if should_run_classifier:
+                intent_result = await asyncio.to_thread(
+                    _classify_wati_turn_intent_in_thread,
+                    thread_id,
+                    message_id,
+                    incoming_message,
+                    payload,
+                    button_reply_id,
+                    history_for_llm,
+                )
+
+                classified_intent = (intent_result.get("intent") or "").strip().upper()
+                same_issue_as_previous = bool(intent_result.get("same_issue_as_previous"))
+                is_unresolved_followup = bool(intent_result.get("is_unresolved_followup"))
+                raw_depth = intent_result.get("issue_followup_depth")
+                issue_followup_depth = raw_depth if isinstance(raw_depth, int) else 1
+                if issue_followup_depth < 1:
+                    issue_followup_depth = 1
+                logger.info(
+                    "LLM_INTENT intent=%s active_branch=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
+                    classified_intent,
+                    intent_result.get("active_branch"),
+                    phone,
+                    same_issue_as_previous,
+                    is_unresolved_followup,
+                    issue_followup_depth,
+                )
+
+            support_mode, scam_context = resolve_scam_context_from_turn(
+                history_for_llm or [],
+                incoming_message,
+                button_reply_id or "",
+                intent_result=intent_result,
+            )
+            logger.info(
+                "ROUTE_CONTEXT phone=%s button=%s support_mode=%s active_branch=%s scam_context=%s msg_preview=%s",
+                phone,
+                (button_reply_id or "")[:16],
+                support_mode,
+                (intent_result.get("active_branch") or ""),
+                scam_context,
+                (incoming_message or "")[:80],
+            )
+
+            # Deterministic signal for unresolved button taps.
+            # Button input is an explicit unresolved follow-up on current issue.
+            if button_reply_id == "not_resolved":
+                is_unresolved_followup = True
+                same_issue_as_previous = True
+                issue_followup_depth = max(issue_followup_depth, 2)
             db = SessionLocal()
             try:
-                intent_result = await classify_wati_turn_intent(
-                    db,
-                    thread_id=thread_id,
-                    current_message_id=message_id,
-                    current_message=incoming_message,
-                    payload=payload,
-                    button_reply_id=button_reply_id,
-                    history=history_for_llm,
+                last_msg = (
+                    db.query(Message)
+                    .filter(
+                        Message.thread_id == thread_id,
+                        Message.is_deleted.is_(False),
+                        Message.id != message_id,
+                    )
+                    .order_by(desc(Message.created))
+                    .first()
+                )
+                awaiting_handoff_confirm = bool(
+                    last_msg
+                    and (
+                        (last_msg.message_source or "").strip() == "handoff_confirmation"
+                        or _is_handoff_confirmation_message(last_msg.bot_response or "")
+                    )
                 )
                 db.commit()
             except Exception:
@@ -600,423 +732,356 @@ async def process_incoming_message(
                 raise
             finally:
                 db.close()
-
-            classified_intent = (intent_result.get("intent") or "").strip().upper()
-            same_issue_as_previous = bool(intent_result.get("same_issue_as_previous"))
-            is_unresolved_followup = bool(intent_result.get("is_unresolved_followup"))
-            raw_depth = intent_result.get("issue_followup_depth")
-            issue_followup_depth = raw_depth if isinstance(raw_depth, int) else 1
-            if issue_followup_depth < 1:
+            if awaiting_handoff_confirm:
+                confirm_reply = _handoff_confirm_decision(incoming_message)
+                declined_handoff = confirm_reply == "NO"
+            is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
+            if scam_context:
+                is_unresolved = False
                 issue_followup_depth = 1
-            logger.info(
-                "LLM_INTENT intent=%s active_branch=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
-                classified_intent,
-                intent_result.get("active_branch"),
-                phone,
-                same_issue_as_previous,
-                is_unresolved_followup,
-                issue_followup_depth,
-            )
 
-        support_mode, scam_context = resolve_scam_context_from_turn(
-            history_for_llm or [],
-            incoming_message,
-            button_reply_id or "",
-            intent_result=intent_result,
-        )
-        logger.info(
-            "ROUTE_CONTEXT phone=%s button=%s support_mode=%s active_branch=%s scam_context=%s msg_preview=%s",
-            phone,
-            (button_reply_id or "")[:16],
-            support_mode,
-            (intent_result.get("active_branch") or ""),
-            scam_context,
-            (incoming_message or "")[:80],
-        )
+            if classified_intent == "RESOLVED":
+                # On scam path, only the main LLM closes via conversation_control (RULE 0).
+                allow_resolve = not scam_context
+                if allow_resolve:
+                    control_result = conversation_control.invoke({"action": "resolved"})
+                    override = {
+                        "kind": "control",
+                        "action": (control_result.get("action") or "").strip(),
+                        "message_source": "intent_classifier",
+                        "confidence_score": None,
+                    }
 
-        # Deterministic signal for unresolved button taps.
-        # Button input is an explicit unresolved follow-up on current issue.
-        if button_reply_id == "not_resolved":
-            is_unresolved_followup = True
-            same_issue_as_previous = True
-            issue_followup_depth = max(issue_followup_depth, 2)
-        db = SessionLocal()
-        try:
-            last_msg = (
-                db.query(Message)
-                .filter(
-                    Message.thread_id == thread_id,
-                    Message.is_deleted.is_(False),
-                    Message.id != message_id,
-                )
-                .order_by(desc(Message.created))
-                .first()
-            )
-            awaiting_handoff_confirm = bool(
-                last_msg
-                and (
-                    (last_msg.message_source or "").strip() == "handoff_confirmation"
-                    or _is_handoff_confirmation_message(last_msg.bot_response or "")
-                )
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        if awaiting_handoff_confirm:
-            confirm_reply = _handoff_confirm_decision(incoming_message)
-            declined_handoff = confirm_reply == "NO"
-        is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
-        if scam_context:
-            is_unresolved = False
-            issue_followup_depth = 1
+            # --- Human ticket resolved (WATI UI) ---
+            ticket_raw = str(payload.get("ticketStatus") or payload.get("ticket_status") or "").strip().upper()
+            if not ticket_raw and isinstance(payload.get("ticket"), dict):
+                tk = payload["ticket"]
+                ticket_raw = str(tk.get("status") or tk.get("ticketStatus") or "").strip().upper()
+            if ticket_raw == "SOLVED":
+                db = SessionLocal()
+                try:
+                    thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
+                    if thread_row:
+                        logger.info(
+                            "human_resolution_detected thread_id=%s phone=%s",
+                            thread_id,
+                            phone,
+                        )
+                        resolve_thread_and_create_new_chatbot_thread(db, thread_id)
+                        db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                finally:
+                    db.close()
+                return
 
-        if classified_intent == "RESOLVED":
-            # On scam path, only the main LLM closes via conversation_control (RULE 0).
-            allow_resolve = not scam_context
-            if allow_resolve:
-                control_result = conversation_control.invoke({"action": "resolved"})
-                override = {
-                    "kind": "control",
-                    "action": (control_result.get("action") or "").strip(),
-                    "message_source": "intent_classifier",
-                    "confidence_score": None,
-                }
-
-        # --- Human ticket resolved (WATI UI) ---
-        ticket_raw = str(payload.get("ticketStatus") or payload.get("ticket_status") or "").strip().upper()
-        if not ticket_raw and isinstance(payload.get("ticket"), dict):
-            tk = payload["ticket"]
-            ticket_raw = str(tk.get("status") or tk.get("ticketStatus") or "").strip().upper()
-        if ticket_raw == "SOLVED":
+            # --- Human queue (getMessages) or bot → human escalation ---
+            handoff_needed = False
+            handoff_count = 0
+            switched_from_human_to_chatbot_this_turn = False
             db = SessionLocal()
             try:
                 thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-                if thread_row:
+
+                if thread_row and thread_row.role == "techsaathi":
+                    ext_state = await read_wati_timeline_state(str(phone or "").strip())
+
+                    logger.error(
+                        "DEBUG_TIMELINE thread=%s ext_state=%s phone=%s",
+                        thread_id,
+                        ext_state,
+                        phone,
+                    )
+
+                    if ext_state == "resolved":
+                        old_thread_id = thread_id
+                        new_thread_id = resolve_techsaathi_thread_and_create_new_chatbot_thread(
+                            db, thread_id
+                        )
+                        if new_thread_id:
+                            _reassign_message_thread(db, message_id, new_thread_id)
+                            thread_id = new_thread_id
+                            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
+                            switched_from_human_to_chatbot_this_turn = True
+
+                        db.commit()
+
+                        logger.info(
+                            "TECHSAATHI_RESOLVED_SWITCH_TO_BOT old_thread=%s new_thread=%s phone=%s",
+                            old_thread_id,
+                            new_thread_id,
+                            phone,
+                        )
+                    else:
+                        thread_row.status = "assigned"
+                        db.commit()
+
+                        logger.info(
+                            "HUMAN_ACTIVE thread_id=%s phone=%s",
+                            thread_id,
+                            phone,
+                        )
+
+                        _update_bot_response(
+                            message_id,
+                            bot_response="",
+                            message_source="human_active",
+                        )
+
+                        return
+
+                if (
+                    wati_payload_indicates_human_operator(payload)
+                    and thread_row
+                    and thread_row.role == "chatbot"
+                    and thread_row.status == "assigned"
+                ):
+                    hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
+                        db, thread_id
+                    )
+                    if hid:
+                        _reassign_message_thread(db, message_id, hid)
+                        thread_id = hid
+                    db.commit()
                     logger.info(
-                        "human_resolution_detected thread_id=%s phone=%s",
+                        "escalate_human_operator_wati thread_id=%s phone=%s",
                         thread_id,
                         phone,
                     )
-                    resolve_thread_and_create_new_chatbot_thread(db, thread_id)
-                    db.commit()
+                    _update_bot_response(
+                        message_id,
+                        bot_response="",
+                        message_source="human_wati",
+                    )
+                    return
+
+                if thread_row and thread_row.role == "chatbot" and thread_row.status == "assigned":
+                    classifier_requested_handoff = (
+                        classified_intent == "REQUEST_HUMAN" and not declined_handoff
+                    )
+                    if (
+                        awaiting_handoff_confirm
+                        and confirm_reply == "YES"
+                        and not switched_from_human_to_chatbot_this_turn
+                    ):
+                        hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
+                            db, thread_id
+                        )
+                        if hid:
+                            _reassign_message_thread(db, message_id, hid)
+                            thread_id = hid
+                        handoff_needed = True
+                        handoff_count = 1
+                    elif (
+                        classifier_requested_handoff
+                        and not switched_from_human_to_chatbot_this_turn
+                    ):
+                        ask_handoff_confirmation = True
+                    elif (
+                        not scam_context
+                        and same_issue_as_previous
+                        and is_unresolved
+                        and issue_followup_depth >= 3
+                    ):
+                        hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
+                            db, thread_id
+                        )
+                        if hid:
+                            _reassign_message_thread(db, message_id, hid)
+                            thread_id = hid
+                        handoff_needed = True
+                        handoff_count = issue_followup_depth
+                        logger.info(
+                            "handoff_by_issue_followup_depth thread_id=%s phone=%s issue_followup_depth=%s",
+                            thread_id,
+                            phone,
+                            issue_followup_depth,
+                        )
+                db.commit()
             except Exception:
                 db.rollback()
                 raise
             finally:
                 db.close()
-            return
 
-        # --- Human queue (getMessages) or bot → human escalation ---
-        handoff_needed = False
-        handoff_count = 0
-        switched_from_human_to_chatbot_this_turn = False
-        db = SessionLocal()
-        try:
-            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-
-            if thread_row and thread_row.role == "techsaathi":
-                ext_state = await read_wati_timeline_state(str(phone or "").strip())
-
-                logger.error(
-                    "DEBUG_TIMELINE thread=%s ext_state=%s phone=%s",
-                    thread_id,
-                    ext_state,
-                    phone,
-                )
-
-                if ext_state == "resolved":
-                    old_thread_id = thread_id
-                    new_thread_id = resolve_techsaathi_thread_and_create_new_chatbot_thread(
-                        db, thread_id
-                    )
-                    if new_thread_id:
-                        _reassign_message_thread(db, message_id, new_thread_id)
-                        thread_id = new_thread_id
-                        thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-                        switched_from_human_to_chatbot_this_turn = True
-
-                    db.commit()
-
-                    logger.info(
-                        "TECHSAATHI_RESOLVED_SWITCH_TO_BOT old_thread=%s new_thread=%s phone=%s",
-                        old_thread_id,
-                        new_thread_id,
-                        phone,
-                    )
-                else:
-                    thread_row.status = "assigned"
-                    db.commit()
-
-                    logger.info(
-                        "HUMAN_ACTIVE thread_id=%s phone=%s",
-                        thread_id,
-                        phone,
-                    )
-
-                    _update_bot_response(
-                        message_id,
-                        bot_response="",
-                        message_source="human_active",
-                    )
-
-                    return
-
-            if (
-                wati_payload_indicates_human_operator(payload)
-                and thread_row
-                and thread_row.role == "chatbot"
-                and thread_row.status == "assigned"
-            ):
-                hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
-                    db, thread_id
-                )
-                if hid:
-                    _reassign_message_thread(db, message_id, hid)
-                    thread_id = hid
-                db.commit()
-                logger.info(
-                    "escalate_human_operator_wati thread_id=%s phone=%s",
-                    thread_id,
-                    phone,
-                )
+            if awaiting_handoff_confirm and confirm_reply == "UNCLEAR":
+                confirm_text = _dynamic_copy("handoff_confirm")
+                await send_message(phone, confirm_text)
                 _update_bot_response(
                     message_id,
-                    bot_response="",
-                    message_source="human_wati",
+                    bot_response=confirm_text,
+                    message_source="handoff_confirmation",
+                    confidence_score=None,
                 )
                 return
 
-            if thread_row and thread_row.role == "chatbot" and thread_row.status == "assigned":
-                classifier_requested_handoff = (
-                    classified_intent == "REQUEST_HUMAN" and not declined_handoff
+            if handoff_needed:
+                teams = ["support"]
+                base = settings.WATI_API_ENDPOINT.rstrip("/")
+                headers = {
+                    "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
+                    "Content-Type": "application/json",
+                }
+                assignee_email = (
+                    getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
+                    or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
+                    or ""
+                ).strip()
+                # ===== switch assignee source to DB  =====
+                # assignee_email = _pick_handoff_assignee_email() or (
+                #     getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
+                #     or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
+                #     or ""
+                # ).strip()
+
+                channel_number = (getattr(settings, "WATI_CHANNEL_NUMBER", None) or "").strip()
+
+                tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
+                assign_team_url = f"{base}/api/v1/assignTeam"
+                if tenant and not base.rstrip("/").endswith(tenant):
+                    assign_team_url = f"{base}/{tenant}/api/v1/assignTeam"
+                assign_operator_url = f"{base}/api/v1/assignOperator"
+                if tenant and not base.rstrip("/").endswith(tenant):
+                    assign_operator_url = f"{base}/{tenant}/api/v1/assignOperator"
+
+                try:
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        if teams:
+                            r = await client.post(
+                                assign_team_url,
+                                headers=headers,
+                                params={"whatsappNumber": phone},
+                                json={"teams": teams},
+                            )
+                            logger.info(
+                                "WATI assignTeam status=%s text=%s url=%s",
+                                r.status_code,
+                                r.text,
+                                assign_team_url,
+                            )
+                        if assignee_email and phone:
+                            r = await client.post(
+                                assign_operator_url,
+                                headers=headers,
+                                params={"whatsappNumber": phone, "email": assignee_email},
+                            )
+                            logger.info(
+                                "WATI assignOperator status=%s text=%s url=%s",
+                                r.status_code,
+                                r.text,
+                                assign_operator_url,
+                            )
+                        if channel_number and phone:
+                            r = await client.post(
+                                f"{base}/api/v1/updateChatStatus",
+                                headers=headers,
+                                json={
+                                    "ticketStatus": "OPEN",
+                                    "whatsappNumber": phone,
+                                    "channelPhoneNumber": channel_number,
+                                },
+                            )
+                            logger.info(
+                                "WATI updateChatStatus OPEN status=%s text=%s",
+                                r.status_code,
+                                r.text,
+                            )
+                except Exception:
+                    logger.exception("WATI handoff request failed")
+
+                wait_text = _dynamic_copy("handoff_wait")
+                await send_message(phone, wait_text)
+                logger.info(
+                    "handoff_triggered thread_id=%s phone=%s signal_count=%s",
+                    thread_id,
+                    phone,
+                    handoff_count,
                 )
-                if (
-                    awaiting_handoff_confirm
-                    and confirm_reply == "YES"
-                    and not switched_from_human_to_chatbot_this_turn
-                ):
-                    hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
-                        db, thread_id
-                    )
-                    if hid:
-                        _reassign_message_thread(db, message_id, hid)
-                        thread_id = hid
-                    handoff_needed = True
-                    handoff_count = 1
-                elif (
-                    classifier_requested_handoff
-                    and not switched_from_human_to_chatbot_this_turn
-                ):
-                    ask_handoff_confirmation = True
-                elif (
-                    not scam_context
-                    and same_issue_as_previous
-                    and is_unresolved
-                    and issue_followup_depth >= 3
-                ):
-                    hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
-                        db, thread_id
-                    )
-                    if hid:
-                        _reassign_message_thread(db, message_id, hid)
-                        thread_id = hid
-                    handoff_needed = True
-                    handoff_count = issue_followup_depth
-                    logger.info(
-                        "handoff_by_issue_followup_depth thread_id=%s phone=%s issue_followup_depth=%s",
-                        thread_id,
-                        phone,
-                        issue_followup_depth,
-                    )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+                _update_bot_response(
+                    message_id,
+                    bot_response=wait_text,
+                    message_source="handoff",
+                )
+                return
 
-        if awaiting_handoff_confirm and confirm_reply == "UNCLEAR":
-            confirm_text = _dynamic_copy("handoff_confirm")
-            await send_message(phone, confirm_text)
-            _update_bot_response(
-                message_id,
-                bot_response=confirm_text,
-                message_source="handoff_confirmation",
-                confidence_score=None,
-            )
-            return
+            if ask_handoff_confirmation or (
+                classified_intent == "REQUEST_HUMAN"
+                and not awaiting_handoff_confirm
+                and not declined_handoff
+            ):
+                confirm_text = _dynamic_copy("handoff_confirm")
+                await send_message(phone, confirm_text)
+                _update_bot_response(
+                    message_id,
+                    bot_response=confirm_text,
+                    message_source="handoff_confirmation",
+                    confidence_score=None,
+                )
+                return
 
-        if handoff_needed:
-            teams = ["support"]
-            base = settings.WATI_API_ENDPOINT.rstrip("/")
-            headers = {
-                "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
-                "Content-Type": "application/json",
-            }
-            assignee_email = (
-                getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
-                or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
-                or ""
-            ).strip()
-            # ===== switch assignee source to DB  =====
-            # assignee_email = _pick_handoff_assignee_email() or (
-            #     getattr(settings, "WATI_SAKSHAM_ASSIGNEE_EMAIL", None)
-            #     or getattr(settings, "WATI_HANDOFF_ASSIGNEE_EMAIL", None)
-            #     or ""
-            # ).strip()
-
-            channel_number = (getattr(settings, "WATI_CHANNEL_NUMBER", None) or "").strip()
-
-            tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
-            assign_team_url = f"{base}/api/v1/assignTeam"
-            if tenant and not base.rstrip("/").endswith(tenant):
-                assign_team_url = f"{base}/{tenant}/api/v1/assignTeam"
-            assign_operator_url = f"{base}/api/v1/assignOperator"
-            if tenant and not base.rstrip("/").endswith(tenant):
-                assign_operator_url = f"{base}/{tenant}/api/v1/assignOperator"
-
+            # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
+            fresh_chatbot_thread = False
+            post_resolve_welcome_sent = False
+            db = SessionLocal()
             try:
-                async with httpx.AsyncClient(timeout=20.0) as client:
-                    if teams:
-                        r = await client.post(
-                            assign_team_url,
-                            headers=headers,
-                            params={"whatsappNumber": phone},
-                            json={"teams": teams},
-                        )
-                        logger.info(
-                            "WATI assignTeam status=%s text=%s url=%s",
-                            r.status_code,
-                            r.text,
-                            assign_team_url,
-                        )
-                    if assignee_email and phone:
-                        r = await client.post(
-                            assign_operator_url,
-                            headers=headers,
-                            params={"whatsappNumber": phone, "email": assignee_email},
-                        )
-                        logger.info(
-                            "WATI assignOperator status=%s text=%s url=%s",
-                            r.status_code,
-                            r.text,
-                            assign_operator_url,
-                        )
-                    if channel_number and phone:
-                        r = await client.post(
-                            f"{base}/api/v1/updateChatStatus",
-                            headers=headers,
-                            json={
-                                "ticketStatus": "OPEN",
-                                "whatsappNumber": phone,
-                                "channelPhoneNumber": channel_number,
-                            },
-                        )
-                        logger.info(
-                            "WATI updateChatStatus OPEN status=%s text=%s",
-                            r.status_code,
-                            r.text,
-                        )
-            except Exception:
-                logger.exception("WATI handoff request failed")
-
-            wait_text = _dynamic_copy("handoff_wait")
-            await send_message(phone, wait_text)
-            logger.info(
-                "handoff_triggered thread_id=%s phone=%s signal_count=%s",
-                thread_id,
-                phone,
-                handoff_count,
-            )
-            _update_bot_response(
-                message_id,
-                bot_response=wait_text,
-                message_source="handoff",
-            )
-            return
-
-        if ask_handoff_confirmation or (
-            classified_intent == "REQUEST_HUMAN"
-            and not awaiting_handoff_confirm
-            and not declined_handoff
-        ):
-            confirm_text = _dynamic_copy("handoff_confirm")
-            await send_message(phone, confirm_text)
-            _update_bot_response(
-                message_id,
-                bot_response=confirm_text,
-                message_source="handoff_confirmation",
-                confidence_score=None,
-            )
-            return
-
-        # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
-        fresh_chatbot_thread = False
-        post_resolve_welcome_sent = False
-        db = SessionLocal()
-        try:
-            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-            prior_msg_in_same_thread = (
-                db.query(Message)
-                .filter(
-                    Message.thread_id == thread_id,
-                    Message.is_deleted.is_(False),
-                    Message.id != message_id,
+                thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
+                prior_msg_in_same_thread = (
+                    db.query(Message)
+                    .filter(
+                        Message.thread_id == thread_id,
+                        Message.is_deleted.is_(False),
+                        Message.id != message_id,
+                    )
+                    .first()
                 )
-                .first()
-            )
-            prior_thread_exists = (
-                db.query(Thread)
-                .filter(
-                    Thread.conversation_id == conversation_id,
-                    Thread.id != thread_id,
-                )
-                .first()
-            )
-            fresh_chatbot_thread = bool(
-                thread_row
-                and thread_row.role == "chatbot"
-                and not prior_msg_in_same_thread
-                and prior_thread_exists
-            )
-            if fresh_chatbot_thread:
-                prev_thread = (
+                prior_thread_exists = (
                     db.query(Thread)
                     .filter(
                         Thread.conversation_id == conversation_id,
                         Thread.id != thread_id,
                     )
-                    .order_by(desc(Thread.created))
                     .first()
                 )
-                if prev_thread:
-                    last_on_prev = (
-                        db.query(Message)
+                fresh_chatbot_thread = bool(
+                    thread_row
+                    and thread_row.role == "chatbot"
+                    and not prior_msg_in_same_thread
+                    and prior_thread_exists
+                )
+                if fresh_chatbot_thread:
+                    prev_thread = (
+                        db.query(Thread)
                         .filter(
-                            Message.thread_id == prev_thread.id,
-                            Message.is_deleted.is_(False),
+                            Thread.conversation_id == conversation_id,
+                            Thread.id != thread_id,
                         )
-                        .order_by(desc(Message.created))
+                        .order_by(desc(Thread.created))
                         .first()
                     )
-                    if last_on_prev and "post_resolve_welcome" in (
-                        last_on_prev.message_source or ""
-                    ):
-                        post_resolve_welcome_sent = True
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+                    if prev_thread:
+                        last_on_prev = (
+                            db.query(Message)
+                            .filter(
+                                Message.thread_id == prev_thread.id,
+                                Message.is_deleted.is_(False),
+                            )
+                            .order_by(desc(Message.created))
+                            .first()
+                        )
+                        if last_on_prev and "post_resolve_welcome" in (
+                            last_on_prev.message_source or ""
+                        ):
+                            post_resolve_welcome_sent = True
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
 
-        # 3. Generate response from history + tool calling
-        db = SessionLocal()
-        try:
-            turn_meta={
+            # 3. Generate response from history + tool calling
+            turn_meta = {
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
                 "unresolved_rounds": issue_followup_depth,
@@ -1025,21 +1090,16 @@ async def process_incoming_message(
                 "active_branch": (intent_result.get("active_branch") or "").strip().lower(),
                 "classifier_intent": (intent_result.get("intent") or "").strip().upper(),
             }
-            llm_result = override or await generate_wati_reply(
-                db,
+            llm_result = override or await asyncio.to_thread(
+                _generate_wati_reply_in_thread,
                 thread_id,
                 message_id,
                 incoming_message,
-                turn_meta=turn_meta,
-                history=history_for_llm,
+                turn_meta,
+                history_for_llm,
             )
-
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
         finally:
-            db.close()
+            await _stop_typing_indicator(typing_stop, typing_task)
 
         # 4. Send mapped WATI response
         sent = False

@@ -24,11 +24,27 @@ def wati_response_indicates_success(response: httpx.Response) -> bool:
         return False
     return True
 
-def _wati_v1_api_base() -> str:
+def _wati_tenant_api_base() -> str:
     base = settings.WATI_API_ENDPOINT.rstrip("/")
     tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
     if tenant and not base.rstrip("/").endswith(tenant):
         return f"{base}/{tenant}"
+    return base
+
+
+def _wati_v1_api_base() -> str:
+    return _wati_tenant_api_base()
+
+
+def _wati_ext_v3_api_base() -> str:
+    """ext v3 resolves tenant from Bearer token — URL must not include tenant id."""
+    base = settings.WATI_API_ENDPOINT.rstrip("/")
+    tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
+    if tenant and base.endswith(f"/{tenant}"):
+        return base[: -(len(tenant) + 1)]
+    last_segment = base.rsplit("/", 1)[-1]
+    if last_segment.isdigit():
+        return base.rsplit("/", 1)[0]
     return base
 
 
@@ -73,7 +89,62 @@ async def read_wati_timeline_state(phone: str) -> str | None:
     return parse_wati_timeline_for_thread(items)
 
 # =========================================================
-# SEND MESSAGE TO WATI 
+# TYPING INDICATOR (ext v3)
+# =========================================================
+def _typing_indicator_target(phone: str) -> str:
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    channel = (getattr(settings, "WATI_CHANNEL_NUMBER", None) or "").strip()
+    if channel and digits:
+        return f"{channel}:{digits}"
+    return digits
+
+
+async def send_typing_indicator(phone: str) -> bool:
+    if not getattr(settings, "WATI_TYPING_INDICATOR_ENABLED", True):
+        return False
+    target = _typing_indicator_target(phone)
+    if not target:
+        return False
+    url = f"{_wati_ext_v3_api_base()}/api/ext/v3/conversations/typingIndicator"
+    headers = {
+        "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={"target": target},
+            )
+            logger.info(
+                "WATI typingIndicator status=%s target=%s text=%s",
+                response.status_code,
+                target,
+                response.text[:200],
+            )
+            return wati_response_indicates_success(response)
+    except Exception:
+        logger.exception("WATI typingIndicator failed target=%s", target)
+        return False
+
+
+async def keep_typing_indicator(phone: str, stop: asyncio.Event) -> None:
+    """Refresh typing every ~20s; WATI auto-dismisses after 25s."""
+    try:
+        while not stop.is_set():
+            await send_typing_indicator(phone)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=20.0)
+                return
+            except asyncio.TimeoutError:
+                continue
+    except asyncio.CancelledError:
+        return
+
+
+# =========================================================
+# SEND MESSAGE TO WATI
 # =========================================================
 async def send_message(phone: str, message: str) -> bool:
     if not phone:
