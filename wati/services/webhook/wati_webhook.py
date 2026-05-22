@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from urllib.parse import quote
 
@@ -24,6 +25,28 @@ def wati_response_indicates_success(response: httpx.Response) -> bool:
         return False
     return True
 
+
+def wati_outbound_message_id(response: httpx.Response) -> str | None:
+    """Extract WATI/WhatsApp message id from a successful send response.
+
+    Poll stores this on the welcome Message row for deduplication and tracing.
+    """
+    if not wati_response_indicates_success(response):
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    msg = data.get("message")
+    if isinstance(msg, dict):
+        for key in ("whatsappMessageId", "id", "localMessageId"):
+            val = str(msg.get(key) or "").strip()
+            if val:
+                return val
+    return None
+
 def _wati_tenant_api_base() -> str:
     base = settings.WATI_API_ENDPOINT.rstrip("/")
     tenant = (getattr(settings, "WATI_TENANT_ID", None) or "").strip()
@@ -48,7 +71,12 @@ def _wati_ext_v3_api_base() -> str:
     return base
 
 
-async def fetch_wati_get_messages(phone: str) -> dict | None:
+async def fetch_wati_get_messages(phone: str, *, page_size: int = 5) -> dict | None:
+    """Fetch WATI conversation timeline for a phone number.
+
+    Poll uses a small page_size (default 5) — only recent ticket events matter
+    for detecting agent close; keeps API payload small.
+    """
     digits = "".join(c for c in str(phone or "") if c.isdigit())
     if not digits:
         return None
@@ -61,23 +89,32 @@ async def fetch_wati_get_messages(phone: str) -> dict | None:
                     "Authorization": f"Bearer {settings.WATI_AUTH_TOKEN}",
                     "Accept": "application/json",
                 },
-                params={"pageNumber": 1, "pageSize": 200},
+                params={"pageNumber": 1, "pageSize": max(1, min(page_size, 50))},
             )
             logger.info("WATI getMessages status=%s url=%s", r.status_code, url[:140])
             if r.status_code >= 400:
                 logger.warning("WATI getMessages body=%s", r.text[:500])
                 return None
-            return r.json()
+            data = r.json()
+            return data
     except Exception:
         logger.exception("WATI getMessages failed")
         return None
 
 
 async def read_wati_timeline_state(phone: str) -> str | None:
-    """resolved | assigned for techsaathi thread.status sync; None if disabled or request failed."""
+    """Map WATI timeline → ``"resolved"`` | ``"assigned"`` for TechSaathi poll.
+
+    HOW:
+    1. GET /api/v1/getMessages (last 5 items)
+    2. Extract ticket events via ``_timeline_items_from_response``
+    3. ``parse_wati_timeline_for_thread`` decides human still active vs closed
+
+    Returns None if disabled (``WATI_EXT_MESSAGES_ENABLED``) or API failed.
+    """
     if not getattr(settings, "WATI_EXT_MESSAGES_ENABLED", True):
         return None
-    data = await fetch_wati_get_messages(phone)
+    data = await fetch_wati_get_messages(phone, page_size=5)
     if not isinstance(data, dict):
         return None
     res = data.get("result")
@@ -86,7 +123,34 @@ async def read_wati_timeline_state(phone: str) -> str | None:
             logger.warning("WATI getMessages unexpected result=%s", res)
             return None
     items = _timeline_items_from_response(data)
-    return parse_wati_timeline_for_thread(items)
+    ext_state = parse_wati_timeline_for_thread(items)
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    # Debug logging — helps trace poll decisions in production.
+    ticket_items = [
+        {
+            "eventType": it.get("eventType"),
+            "eventDescription": it.get("eventDescription"),
+            "created": it.get("created"),
+            "ticketId": it.get("ticketId"),
+        }
+        for it in items
+        if isinstance(it, dict) and str(it.get("eventType") or "").lower() == "ticket"
+    ]
+    logger.info(
+        "WATI getMessages timeline phone=%s ext_state=%s ticket_events=%s",
+        digits,
+        ext_state,
+        json.dumps(ticket_items, ensure_ascii=False),
+    )
+    payload_preview = json.dumps(data, indent=2, ensure_ascii=False)
+    if len(payload_preview) > 8000:
+        payload_preview = payload_preview[:8000] + "\n... (truncated)"
+    logger.info(
+        "WATI getMessages payload phone=%s:\n%s",
+        digits,
+        payload_preview,
+    )
+    return ext_state
 
 # =========================================================
 # TYPING INDICATOR (ext v3)
@@ -192,15 +256,19 @@ async def send_interactive_buttons_message(
     phone: str,
     message: str,
     action: str,
-) -> bool:
+) -> str | None:
+    """Send interactive buttons. Returns WATI message id on success, else None.
+
+    Poll uses the returned id when persisting the post-handoff welcome Message.
+    """
     if not phone:
         logger.warning("Skipping interactive message: phone missing")
-        return False
+        return None
 
     text = (message or "").strip()
     if not text:
         logger.warning("Skipping interactive message: empty body")
-        return False
+        return None
 
     if action == "mode_buttons":
         buttons = [
@@ -212,9 +280,14 @@ async def send_interactive_buttons_message(
             {"id": "resolved", "title": "Resolved "},
             {"id": "not_resolved", "title": "Still Stuck "},
         ]
+    elif action == "scam_os_buttons":
+        buttons = [
+            {"id": "ios", "title": "iPhone / iPad"},
+            {"id": "android", "title": "Android"},
+        ]
     else:
         logger.warning("Unknown interactive action=%s", action)
-        return False
+        return None
 
     url = f"{settings.WATI_API_ENDPOINT}/api/v1/sendInteractiveButtonsMessage"
     headers = {
@@ -245,10 +318,10 @@ async def send_interactive_buttons_message(
                 response.status_code,
                 response.text,
             )
-            return wati_response_indicates_success(response)
+            return wati_outbound_message_id(response)
     except Exception:
         logger.exception("Failed sending interactive buttons action=%s", action)
-        return False
+        return None
 
 
 async def send_interactive_platform_list_message(phone: str, message: str) -> bool:

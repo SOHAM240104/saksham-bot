@@ -65,10 +65,15 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         ),
         "scam_entry": (
             "User tapped Scam Help with no story yet. Write in clear simple English only "
-            "(not Hindi or Hinglish). Warm WhatsApp opening: reassure they did the right thing "
+            " Warm WhatsApp opening: reassure they did the right thing "
             "(use customer_name as '<Name> Ji' when provided). Blank line, then ONE question "
             "what happened — call, message, payment, link, or app. 2-4 short lines; at most "
             "one emoji; never blame the victim."
+        ),
+        "scam_os_prompt": (
+            "User chose Scam Help and phone OS is not known yet. One warm sentence asking "
+            "whether they use iPhone/iPad or Android so guidance can match their phone. "
+            "Plain text only; do not ask what happened yet."
         ),
     }
     fallback = {
@@ -87,6 +92,9 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "scam_entry": (
             "You did exactly the right thing by coming to us.\n\n"
             "Can you please tell me what happened — was it a call, message, payment, link, or app?"
+        ),
+        "scam_os_prompt": (
+            "To guide you better, is your phone an iPhone/iPad or Android?"
         ),
     }
     try:

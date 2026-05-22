@@ -17,10 +17,9 @@ from wati.settings import settings
 
 logger = logging.getLogger("wati.services.conversation")
 MODEL_NAME = "gpt-4.1-mini"
+CLASSIFIER_MODEL_NAME = "gpt-4o-mini"
 MAX_OUTPUT_TOKENS = 1000
 SUPPORTED_PLATFORMS = ("apple", "samsung", "pixel", "oppo", "xiaomi")
-# WhatsApp list row titles — whole message must match (case-insensitive) after platform pick.
-PLATFORM_LIST_SELECTION_TOKENS = frozenset(SUPPORTED_PLATFORMS)
 MAX_TOOL_STEPS = 2
 
 _SCAM_ENTRY_TOKENS = frozenset({"scam", "scam help"})
@@ -58,7 +57,7 @@ def conversation_control(action: str):
 
 
 CLASSIFIER_LLM = ChatOpenAI(
-    model=MODEL_NAME, temperature=0, max_tokens=MAX_OUTPUT_TOKENS
+    model=CLASSIFIER_MODEL_NAME, temperature=0, max_tokens=MAX_OUTPUT_TOKENS
 )
 MAIN_LLM = ChatOpenAI(
     model=MODEL_NAME, temperature=0, max_tokens=MAX_OUTPUT_TOKENS
@@ -100,7 +99,13 @@ def _build_history_messages(db, thread_id: int, current_message_id: int, current
         user_text = (msg.user_message or "").strip()
         bot_text = (msg.bot_response or "").strip()
         if user_text:
-            history.append({"role": "user", "content": user_text})
+            history.append(
+                {
+                    "role": "user",
+                    "content": user_text,
+                    "message_source": (msg.message_source or "").strip(),
+                }
+            )
         if bot_text:
             history.append({"role": "assistant", "content": bot_text})
 
@@ -252,6 +257,25 @@ def _user_chose_scam_support(text: str) -> bool:
     return t in {"scam", "scam help"}
 
 
+def _is_on_tech_path(
+    support_mode: str,
+    current_message: str,
+    button_reply_id: str = "",
+    *,
+    active_branch: str = "",
+) -> bool:
+    """True when the user is on (or just chose) Tech Help — never show scam-only UI."""
+    btn = (button_reply_id or "").strip().lower()
+    branch = (active_branch or "").strip().lower()
+    if btn == "tech" or _user_chose_tech_support(current_message):
+        return True
+    if (support_mode or "").strip().lower() == "tech":
+        return True
+    if branch == "tech":
+        return True
+    return False
+
+
 def _coerce_bool_field(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -334,6 +358,8 @@ def resolve_scam_context_from_turn(
         mode = "tech"
     elif btn == "scam" or _user_chose_scam_support(msg):
         mode = "scam"
+    elif btn in {"ios", "android"} and (mode or "").strip().lower() == "tech":
+        mode = "tech"
     elif switch == "yes" and _assistant_offered_branch_change(history, "scam"):
         mode = "scam"
     elif switch == "yes" and _assistant_offered_branch_change(history, "tech"):
@@ -409,6 +435,36 @@ def _is_scam_entry_message(text: str, button_reply_id: str = "") -> bool:
     return btn == "scam" or t in _SCAM_ENTRY_TOKENS
 
 
+def _is_scam_os_reply(button_reply_id: str = "") -> bool:
+    return (button_reply_id or "").strip().lower() in {"ios", "android"}
+
+
+def _phone_os_from_message_source(message_source: str) -> str:
+    for part in (message_source or "").split(","):
+        source = part.strip().lower()
+        if source == "scam_os:ios":
+            return "ios"
+        if source == "scam_os:android":
+            return "android"
+    return ""
+
+
+def _known_scam_phone_os(
+    history: list[dict],
+    button_reply_id: str = "",
+) -> str:
+    """OS is set only by explicit iOS/Android button taps, persisted as scam_os:* on the message."""
+    if _is_scam_os_reply(button_reply_id):
+        return (button_reply_id or "").strip().lower()
+    for item in reversed(history):
+        if item.get("role") != "user":
+            continue
+        os = _phone_os_from_message_source(item.get("message_source") or "")
+        if os:
+            return os
+    return ""
+
+
 def _user_has_described_scam_situation(
     history: list[dict],
     current_message: str,
@@ -416,13 +472,23 @@ def _user_has_described_scam_situation(
 ) -> bool:
     """True when the user has given enough context beyond a bare Scam Help tap."""
     current = (current_message or "").strip()
-    if current and not _is_scam_entry_message(current, button_reply_id) and len(current) >= 20:
+    if (
+        current
+        and not _is_scam_entry_message(current, button_reply_id)
+        and not _is_scam_os_reply(button_reply_id)
+        and len(current) >= 20
+    ):
         return True
     for item in history:
         if item.get("role") != "user":
             continue
         content = (item.get("content") or "").strip()
-        if content and not _is_scam_entry_message(content) and len(content) >= 20:
+        if (
+            content
+            and not _is_scam_entry_message(content)
+            and not _phone_os_from_message_source(item.get("message_source") or "")
+            and len(content) >= 20
+        ):
             return True
     return False
 
@@ -449,21 +515,19 @@ def _scam_text_reply(message: str, retrieval_sources: list[str] | None = None) -
     }
 
 
-def _is_platform_list_selection_only(text: str) -> bool:
-    t = (text or "").strip().lower().rstrip(".!? ")
-    return t in PLATFORM_LIST_SELECTION_TOKENS
-
-
-def _issue_prompt_for_platform(slug: str) -> str:
-    labels = {
-        "apple": "iPhone or iPad",
-        "samsung": "Samsung phone",
-        "pixel": "Pixel",
-        "oppo": "Oppo phone",
-        "xiaomi": "Xiaomi or Redmi phone",
-    }
-    device = labels.get((slug or "").strip().lower(), "phone")
-    return f"What issue are you having with your {device}?"
+def _recent_user_messages_snippet(history: list[dict], *, limit: int = 8) -> str:
+    """Verbatim recent user lines for runtime_context — no issue/platform heuristics."""
+    lines: list[str] = []
+    for item in history:
+        if item.get("role") != "user":
+            continue
+        content = (item.get("content") or "").strip()
+        if content:
+            lines.append(content[:500])
+    if not lines:
+        return "none"
+    recent = lines[-limit:]
+    return "\n".join(f"  - {line}" for line in recent)
 
 
 def _infer_support_mode(history: list[dict]) -> str:
@@ -769,28 +833,49 @@ async def generate_wati_reply(
     pending_user_issue = _pending_user_issue_from_history(
         history, current_message, button_reply_id
     )
+    recent_user_messages = _recent_user_messages_snippet(history)
+    active_branch = (turn_meta.get("active_branch") or "").strip().lower()
+    on_tech_path = _is_on_tech_path(
+        support_mode,
+        current_message,
+        button_reply_id,
+        active_branch=active_branch,
+    )
+    known_phone_os = ""
+    if scam_mode and not on_tech_path:
+        known_phone_os = _known_scam_phone_os(history, button_reply_id)
 
-    if support_mode == "tech" and _is_platform_list_selection_only(current_message):
-        slug = _infer_platform(current_message)
-        if slug in SUPPORTED_PLATFORMS:
+    if (
+        scam_mode
+        and not on_tech_path
+        and not _user_has_described_scam_situation(
+            history, current_message, button_reply_id
+        )
+    ):
+        if not known_phone_os and _is_scam_entry_message(current_message, button_reply_id):
+            os_prompt = dynamic_copy(
+                "scam_os_prompt",
+                context={"customer_name": (customer_name or "").strip()},
+            )
+            return {
+                "kind": "action",
+                "action": "scam_os_buttons",
+                "message": os_prompt,
+                "message_source": "scam_os_prompt,dynamic_copy",
+            }
+        if known_phone_os and (
+            _is_scam_os_reply(button_reply_id)
+            or _is_scam_entry_message(current_message, button_reply_id)
+        ):
+            entry_text = dynamic_copy(
+                "scam_entry",
+                context={"customer_name": (customer_name or "").strip()},
+            )
             return {
                 "kind": "text",
-                "message": _issue_prompt_for_platform(slug),
-                "message_source": "",
+                "message": entry_text,
+                "message_source": "scam_entry,dynamic_copy",
             }
-
-    if scam_mode and not _user_has_described_scam_situation(
-        history, current_message, button_reply_id
-    ) and _is_scam_entry_message(current_message, button_reply_id):
-        entry_text = dynamic_copy(
-            "scam_entry",
-            context={"customer_name": (customer_name or "").strip()},
-        )
-        return {
-            "kind": "text",
-            "message": entry_text,
-            "message_source": "scam_entry,dynamic_copy",
-        }
 
     messages = _to_langchain_messages(history)
     messages.insert(
@@ -806,9 +891,12 @@ async def generate_wati_reply(
                 f"prior_turns_snippet: {prior_turns_snippet or 'none'}\n"
                 f"support_mode: {support_mode or 'none'}\n"
                 f"known_platform: {runtime_context.get('known_platform') or 'unknown'}\n"
+                f"known_phone_os: {known_phone_os or 'unknown'}\n"
                 f"known_os_version: {runtime_context.get('known_os_version') or 'unknown'}\n"
                 f"known_model: {runtime_context.get('known_model') or 'unknown'}\n"
                 f"customer_name: {customer_name or 'unknown'}\n"
+                f"latest_user_message: {(current_message or '').strip() or 'none'}\n"
+                f"recent_user_messages:\n{recent_user_messages}\n"
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
@@ -816,6 +904,8 @@ async def generate_wati_reply(
                 f"scam_mode_active: {str(scam_mode).lower()}\n"
                 f"active_branch: {(turn_meta.get('active_branch') or support_mode or 'infer_from_history')}\n"
                 f"pending_user_issue: {pending_user_issue or 'none'}\n"
+                "Before RULE 3: read recent_user_messages and full history — not only latest_user_message.\n"
+                "If the user already described a tech goal or problem in an earlier message and the latest message only selects Tech Help or a phone brand, issue is known: use RULE 2b (search_support_docs); do not ask what issue they are having.\n"
                 "Routing (tech vs scam) is YOUR job via <routing_intelligence> and RULE 0 — read full history every turn.\n"
                 "support_mode / scam_mode_active / active_branch are hints only — if history clearly shows scam safety, follow RULE 0 even when flags were false on a typed-first message.\n"
                 "Never close a scam crisis with a generic 'glad everything is working' line; never send platform_buttons mid-scam.\n"
@@ -825,7 +915,12 @@ async def generate_wati_reply(
                 "FIRST URGENT after OTP/credentials: Step 1 = call bank to block only — NO bank phone number unless user already named that bank in history; never default to HDFC. Closing must offer helpline when they reply with bank name.\n"
                 "Bank helpline follow-up: when user names a bank or asks for number → one line from scam_reference_numbers only; no 1930/complaint in same turn.\n"
                 "When on scam path: plain text only; no send_mode_buttons, send_platform_buttons, send_feedback_buttons, or search_support_docs.\n"
-                "Scam Help tap only (no situation described yet): handled by dynamic entry copy — not your turn.\n"
+                "Scam Help entry (no story yet): system asks phone OS once (iOS/Android buttons) only on scam branch — NEVER on tech branch.\n"
+                "When support_mode or active_branch is tech: never send or reference scam OS buttons; known_phone_os must stay unknown.\n"
+                "When known_phone_os is ios: never suggest APK sideloading or Android-only app install steps; iPhones use App Store only — for fake apps use delete app / Settings > General > iPhone Storage, or remove unknown configuration profiles.\n"
+                "When known_phone_os is android: APK/fake-app guidance from scam flow applies (do not open, uninstall via Settings > Apps).\n"
+                "Do not re-ask iOS vs Android once known_phone_os is set.\n"
+                "known_phone_os is set ONLY from explicit iOS/Android button taps — never infer from typed phone brand or model.\n"
                 "When the user has described their situation: MUST call search_scam_kb first, then <scam_unified_flow> (comfort → category → MO; contextual check — not always money/OTP).\n"
                 "Complaint (1930): plain text REPORT/HOW TO FILE only; end with one warm natural line offering prevention tips (no 'reply yes'). If user clearly wants tips: search_scam_kb(prevention) then PREVENTION in plain text.\n"
                 "Never repeat prior-thread welcome-back text when entering scam help or when the user already described a scam in this thread.\n"

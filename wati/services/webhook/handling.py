@@ -34,7 +34,6 @@ from .parse import (
 # from .feature import FreeTierThreadLimitReached, free_thread_limit
 from .wati_webhook import (
     keep_typing_indicator,
-    read_wati_timeline_state,
     send_interactive_buttons_message,
     send_interactive_platform_list_message,
     send_message,
@@ -91,6 +90,8 @@ def _default_button_message(action: str) -> str:
         return "Which phone are you using?"
     if action == "feedback_buttons":
         return _dynamic_copy("feedback_checkin")
+    if action == "scam_os_buttons":
+        return "To guide you better, is your phone an iPhone/iPad or Android?"
     return "Please choose an option."
 
 
@@ -409,6 +410,9 @@ def _update_bot_response_sync(
             if template is not None:
                 msg.template = template
             if message_source is not None:
+                prev = (msg.message_source or "").strip()
+                if prev.startswith("scam_os:") and not message_source.startswith("scam_os:"):
+                    message_source = f"{prev},{message_source}"
                 msg.message_source = message_source
             if confidence_score is not None:
                 msg.confidence_score = confidence_score
@@ -480,23 +484,6 @@ def resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
     db.add(human_thread)
     db.flush()
     return human_thread.id
-
-
-def resolve_techsaathi_thread_and_create_new_chatbot_thread(db, thread_id: int) -> int | None:
-    """Resolve techsaathi thread and start a fresh chatbot thread."""
-    thread = db.query(Thread).filter(Thread.id == thread_id).first()
-    if not thread or thread.role != "techsaathi":
-        return None
-    thread.status = "resolved"
-    # free_thread_limit(db, thread.conversation_id)
-    next_thread = Thread(
-        conversation_id=thread.conversation_id,
-        role="chatbot",
-        status="assigned",
-    )
-    db.add(next_thread)
-    db.flush()
-    return next_thread.id
 
 
 def _reassign_message_thread(db, message_id: int, new_thread_id: int) -> None:
@@ -651,12 +638,68 @@ async def process_incoming_message(
         finally:
             db.close()
 
+        from .techsaathi_poll import handle_techsaathi_incoming_message
+
+        # --- TechSaathi gate (poll module) ---
+        # Before classifier/LLM: if user is with a human, either stay silent or
+        # switch back to bot when WATI shows the agent closed the chat.
+        techsaathi_turn = await handle_techsaathi_incoming_message(
+            thread_id, message_id, phone
+        )
+        if techsaathi_turn.kind == "human_active":
+            logger.info("HUMAN_ACTIVE thread_id=%s phone=%s", thread_id, phone)
+            _update_bot_response(
+                message_id,
+                bot_response="",
+                message_source="human_active",
+            )
+            return
+        if techsaathi_turn.kind == "resolved":
+            # Poll path already sent welcome buttons; record that on this message row.
+            _update_bot_response(
+                message_id,
+                bot_response=techsaathi_turn.welcome_text,
+                message_source=techsaathi_turn.welcome_source,
+            )
+            return
+
+        on_techsaathi_thread = False
+        active_techsaathi_thread = False
+        db = SessionLocal()
+        try:
+            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
+            on_techsaathi_thread = bool(thread_row and thread_row.role == "techsaathi")
+            active_techsaathi_thread = bool(
+                thread_row
+                and thread_row.role == "techsaathi"
+                and thread_row.status == "assigned"
+            )
+        finally:
+            db.close()
+
+        # Safety net: never run LLM while human is still assigned.
+        if active_techsaathi_thread:
+            logger.warning(
+                "TECHSAATHI_ACTIVE_SAFETY_RETURN thread_id=%s phone=%s",
+                thread_id,
+                phone,
+            )
+            _update_bot_response(
+                message_id,
+                bot_response="",
+                message_source="human_active",
+            )
+            return
+
         typing_stop = asyncio.Event()
         typing_task = asyncio.create_task(keep_typing_indicator(phone, typing_stop))
         await send_typing_indicator(phone)
         try:
             intent_result: dict = {}
-            should_run_classifier = bool(incoming_message.strip()) or bool(button_reply_id)
+            should_run_classifier = (
+                (bool(incoming_message.strip()) or bool(button_reply_id))
+                and not on_techsaathi_thread  # no intent LLM while on human thread
+            )
             if should_run_classifier:
                 intent_result = await asyncio.to_thread(
                     _classify_wati_turn_intent_in_thread,
@@ -691,6 +734,15 @@ async def process_incoming_message(
                 button_reply_id or "",
                 intent_result=intent_result,
             )
+            if (
+                button_reply_id in {"ios", "android"}
+                and scam_context
+                and (support_mode or "").strip().lower() != "tech"
+            ):
+                _update_bot_response(
+                    message_id,
+                    message_source=f"scam_os:{button_reply_id}",
+                )
             logger.info(
                 "ROUTE_CONTEXT phone=%s button=%s support_mode=%s active_branch=%s scam_context=%s msg_preview=%s",
                 phone,
@@ -752,22 +804,44 @@ async def process_incoming_message(
                         "confidence_score": None,
                     }
 
-            # --- Human ticket resolved (WATI UI) ---
+            # --- WATI ticketStatus=SOLVED webhook (agent closed in WATI UI) ---
             ticket_raw = str(payload.get("ticketStatus") or payload.get("ticket_status") or "").strip().upper()
             if not ticket_raw and isinstance(payload.get("ticket"), dict):
                 tk = payload["ticket"]
                 ticket_raw = str(tk.get("status") or tk.get("ticketStatus") or "").strip().upper()
             if ticket_raw == "SOLVED":
+                from .techsaathi_poll import (
+                    resolve_techsaathi_thread_and_create_new_chatbot_thread,
+                    send_post_techsaathi_return_welcome,
+                )
+
                 db = SessionLocal()
                 try:
                     thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
                     if thread_row:
                         logger.info(
-                            "human_resolution_detected thread_id=%s phone=%s",
+                            "human_resolution_detected thread_id=%s phone=%s role=%s",
                             thread_id,
                             phone,
+                            thread_row.role,
                         )
-                        resolve_thread_and_create_new_chatbot_thread(db, thread_id)
+                        # Techsaathi handoff: same thread switch + welcome as the poll path.
+                        if (
+                            thread_row.role == "techsaathi"
+                            and thread_row.status == "assigned"
+                        ):
+                            new_id = resolve_techsaathi_thread_and_create_new_chatbot_thread(
+                                db, thread_id
+                            )
+                            if new_id:
+                                await send_post_techsaathi_return_welcome(
+                                    db,
+                                    conversation_id=thread_row.conversation_id,
+                                    new_thread_id=new_id,
+                                    phone=phone,
+                                )
+                        else:
+                            resolve_thread_and_create_new_chatbot_thread(db, thread_id)
                         db.commit()
                 except Exception:
                     db.rollback()
@@ -783,53 +857,6 @@ async def process_incoming_message(
             db = SessionLocal()
             try:
                 thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-
-                if thread_row and thread_row.role == "techsaathi":
-                    ext_state = await read_wati_timeline_state(str(phone or "").strip())
-
-                    logger.error(
-                        "DEBUG_TIMELINE thread=%s ext_state=%s phone=%s",
-                        thread_id,
-                        ext_state,
-                        phone,
-                    )
-
-                    if ext_state == "resolved":
-                        old_thread_id = thread_id
-                        new_thread_id = resolve_techsaathi_thread_and_create_new_chatbot_thread(
-                            db, thread_id
-                        )
-                        if new_thread_id:
-                            _reassign_message_thread(db, message_id, new_thread_id)
-                            thread_id = new_thread_id
-                            thread_row = db.query(Thread).filter(Thread.id == thread_id).first()
-                            switched_from_human_to_chatbot_this_turn = True
-
-                        db.commit()
-
-                        logger.info(
-                            "TECHSAATHI_RESOLVED_SWITCH_TO_BOT old_thread=%s new_thread=%s phone=%s",
-                            old_thread_id,
-                            new_thread_id,
-                            phone,
-                        )
-                    else:
-                        thread_row.status = "assigned"
-                        db.commit()
-
-                        logger.info(
-                            "HUMAN_ACTIVE thread_id=%s phone=%s",
-                            thread_id,
-                            phone,
-                        )
-
-                        _update_bot_response(
-                            message_id,
-                            bot_response="",
-                            message_source="human_active",
-                        )
-
-                        return
 
                 if (
                     wati_payload_indicates_human_operator(payload)
@@ -1009,6 +1036,7 @@ async def process_incoming_message(
                 classified_intent == "REQUEST_HUMAN"
                 and not awaiting_handoff_confirm
                 and not declined_handoff
+                and not switched_from_human_to_chatbot_this_turn
             ):
                 confirm_text = _dynamic_copy("handoff_confirm")
                 await send_message(phone, confirm_text)
@@ -1073,6 +1101,23 @@ async def process_incoming_message(
                             last_on_prev.message_source or ""
                         ):
                             post_resolve_welcome_sent = True
+                if not post_resolve_welcome_sent:
+                    # Poll may have sent welcome on this thread already — skip duplicate.
+                    prior_bot_welcome = (
+                        db.query(Message)
+                        .filter(
+                            Message.thread_id == thread_id,
+                            Message.is_deleted.is_(False),
+                            Message.id != message_id,
+                            Message.bot_response.isnot(None),
+                        )
+                        .order_by(desc(Message.created))
+                        .first()
+                    )
+                    if prior_bot_welcome and "post_resolve_welcome" in (
+                        prior_bot_welcome.message_source or ""
+                    ):
+                        post_resolve_welcome_sent = True
                 db.commit()
             except Exception:
                 db.rollback()
@@ -1168,12 +1213,28 @@ async def process_incoming_message(
             bot_response = "\n\n---\n\n".join(bot_chunks)
         elif llm_result.get("kind") == "action":
             action = llm_result.get("action")
-            action_message = (llm_result.get("message") or "").strip() or _default_button_message(action)
-            bot_response = action_message
-            if action == "platform_buttons":
+            if action == "scam_os_buttons" and (
+                (support_mode or "").strip().lower() == "tech" or not scam_context
+            ):
+                logger.warning(
+                    "Blocked scam_os_buttons phone=%s support_mode=%s scam_context=%s",
+                    phone,
+                    support_mode,
+                    scam_context,
+                )
+                action_message = (
+                    (llm_result.get("message") or "").strip()
+                    or _default_button_message("platform_buttons")
+                )
+                bot_response = action_message
                 sent = await send_interactive_platform_list_message(phone, action_message)
             else:
-                sent = await send_interactive_buttons_message(phone, action_message, action)
+                action_message = (llm_result.get("message") or "").strip() or _default_button_message(action)
+                bot_response = action_message
+                if action == "platform_buttons":
+                    sent = await send_interactive_platform_list_message(phone, action_message)
+                else:
+                    sent = await send_interactive_buttons_message(phone, action_message, action)
         else:
             bot_response = (llm_result.get("message") or "").strip()
             sent = await send_message(phone, bot_response)

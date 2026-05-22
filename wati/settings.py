@@ -18,8 +18,12 @@ class Settings(BaseSettings):
     WATI_SAKSHAM_ASSIGNEE_EMAIL: str = "webmaster@sakshamsenior.com"
     # WATI WhatsApp Business / channel number (digits, country code, no spaces) for updateChatStatus
     WATI_CHANNEL_NUMBER: str = "919999043434"
-    # When thread is human (techsaathi), poll ext v3 GET …/messages to detect agent-closed chat
+    # When thread is human (techsaathi), call GET …/messages to read WATI ticket timeline
     WATI_EXT_MESSAGES_ENABLED: bool = True
+    # --- TechSaathi background poll (see wati/services/webhook/techsaathi_poll.py) ---
+    WATI_TECHSAATHI_POLL_ENABLED: bool = True  # master switch; started in app.main lifespan
+    WATI_TECHSAATHI_POLL_INTERVAL_SECONDS: int = 60  # sleep between ticks when humans are active
+    WATI_TECHSAATHI_POLL_IDLE_SECONDS: int = 300  # sleep when no techsaathi threads to watch
     # POST /api/ext/v3/conversations/typingIndicator while preparing a reply
     WATI_TYPING_INDICATOR_ENABLED: bool = True
     BANK_HELPLINE_URL: str = ""
