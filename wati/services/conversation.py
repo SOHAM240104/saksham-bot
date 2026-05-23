@@ -20,6 +20,16 @@ MODEL_NAME = "gpt-4.1-mini"
 CLASSIFIER_MODEL_NAME = "gpt-4o-mini"
 MAX_OUTPUT_TOKENS = 1000
 SUPPORTED_PLATFORMS = ("apple", "samsung", "pixel", "oppo", "xiaomi")
+# WhatsApp list row titles — whole message must match (case-insensitive) after platform pick.
+PLATFORM_LIST_SELECTION_TOKENS = frozenset(SUPPORTED_PLATFORMS)
+_PLATFORM_LIST_TEXT_ALIASES = frozenset(
+    {
+        "google pixel",
+        "iphone / ipad",
+        "redmi / poco",
+        "galaxy",
+    }
+)
 MAX_TOOL_STEPS = 2
 
 _SCAM_ENTRY_TOKENS = frozenset({"scam", "scam help"})
@@ -30,6 +40,15 @@ _SCAM_KB_TOOL_PREFIX = (
     "for warmth only).\n\n"
     "--- KNOWLEDGE BASE EXCERPTS ---\n"
 )
+
+
+def _is_platform_only_user_message(text: str, button_reply_id: str = "") -> bool:
+    """True when the user message is only a phone-brand list pick (not a tech issue)."""
+    btn = (button_reply_id or "").strip().lower()
+    if btn in PLATFORM_LIST_SELECTION_TOKENS:
+        return True
+    t = (text or "").strip().lower().rstrip(".!? ")
+    return t in PLATFORM_LIST_SELECTION_TOKENS or t in _PLATFORM_LIST_TEXT_ALIASES
 
 
 @tool("send_mode_buttons")
@@ -405,6 +424,8 @@ def _pending_user_issue_from_history(
             continue
         if _is_scam_entry_message(content) or _user_chose_tech_support(content):
             continue
+        if _is_platform_only_user_message(content):
+            continue
         if _user_switch_reply(content) or len(content) < 12:
             continue
         return content[:500]
@@ -413,6 +434,7 @@ def _pending_user_issue_from_history(
         current
         and not _is_branch_change_short_reply(current)
         and not _user_switch_reply(current)
+        and not _is_platform_only_user_message(current, button_reply_id)
         and len(current) >= 12
         and not _is_scam_entry_message(current)
     ):
@@ -515,6 +537,23 @@ def _scam_text_reply(message: str, retrieval_sources: list[str] | None = None) -
     }
 
 
+def _is_platform_list_selection_only(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip(".!? ")
+    return t in PLATFORM_LIST_SELECTION_TOKENS
+
+
+def _issue_prompt_for_platform(slug: str) -> str:
+    labels = {
+        "apple": "iPhone or iPad",
+        "samsung": "Samsung phone",
+        "pixel": "Pixel",
+        "oppo": "Oppo phone",
+        "xiaomi": "Xiaomi or Redmi phone",
+    }
+    device = labels.get((slug or "").strip().lower(), "phone")
+    return f"What issue are you having with your {device}?"
+
+
 def _recent_user_messages_snippet(history: list[dict], *, limit: int = 8) -> str:
     """Verbatim recent user lines for runtime_context — no issue/platform heuristics."""
     lines: list[str] = []
@@ -557,6 +596,50 @@ def _infer_platform(text: str) -> str:
     if re.search(r"\b(xiaomi|xiomi|redmi|poco)\b", lowered):
         return "xiaomi"
     return ""
+
+
+def _is_platform_list_selection(text: str, button_reply_id: str = "") -> bool:
+    return _is_platform_only_user_message(text, button_reply_id)
+
+
+def _platform_slug_from_turn(text: str, button_reply_id: str = "") -> str:
+    btn = (button_reply_id or "").strip().lower()
+    if btn in SUPPORTED_PLATFORMS:
+        return btn
+    t = (text or "").strip().lower().rstrip(".!? ")
+    if t in PLATFORM_LIST_SELECTION_TOKENS:
+        return t
+    slug = _infer_platform(text)
+    if slug in SUPPORTED_PLATFORMS:
+        return slug
+    return ""
+
+
+def _should_ask_tech_issue_before_retrieval(
+    *,
+    on_tech_path: bool,
+    scam_mode: bool,
+    pending_user_issue: str,
+    unresolved_signal: bool,
+    current_message: str,
+    button_reply_id: str = "",
+    user_query: str = "",
+) -> str:
+    """Return platform slug when brand-only — must ask issue before search_support_docs."""
+    if not on_tech_path or scam_mode or unresolved_signal:
+        return ""
+    is_platform_turn = _is_platform_only_user_message(
+        current_message, button_reply_id
+    ) or _is_platform_only_user_message(user_query, "")
+    if not is_platform_turn:
+        return ""
+    # RULE 2b: real issue already stated earlier — skip issue prompt, go to retrieval.
+    if pending_user_issue and not _is_platform_only_user_message(pending_user_issue, ""):
+        return ""
+    slug = _platform_slug_from_turn(current_message, button_reply_id)
+    if not slug and user_query:
+        slug = _platform_slug_from_turn(user_query, button_reply_id)
+    return slug if slug in SUPPORTED_PLATFORMS else ""
 
 
 def _infer_os_version(text: str) -> str:
@@ -845,6 +928,22 @@ async def generate_wati_reply(
     if scam_mode and not on_tech_path:
         known_phone_os = _known_scam_phone_os(history, button_reply_id)
 
+    unresolved_signal = bool(turn_meta.get("unresolved_signal_current_turn"))
+    platform_issue_slug = _should_ask_tech_issue_before_retrieval(
+        on_tech_path=on_tech_path,
+        scam_mode=scam_mode,
+        pending_user_issue=pending_user_issue,
+        unresolved_signal=unresolved_signal,
+        current_message=current_message,
+        button_reply_id=button_reply_id,
+    )
+    if platform_issue_slug:
+        return {
+            "kind": "text",
+            "message": _issue_prompt_for_platform(platform_issue_slug),
+            "message_source": "platform_issue_prompt",
+        }
+
     if (
         scam_mode
         and not on_tech_path
@@ -1019,6 +1118,22 @@ async def generate_wati_reply(
                         "action": "platform_buttons",
                         "message": "Which phone are you using?",
                     }
+                base_query = str(args.get("user_query") or current_message or "").strip()
+                blocked_slug = _should_ask_tech_issue_before_retrieval(
+                    on_tech_path=on_tech_path,
+                    scam_mode=scam_mode,
+                    pending_user_issue=pending_user_issue,
+                    unresolved_signal=unresolved_signal,
+                    current_message=current_message,
+                    button_reply_id=button_reply_id,
+                    user_query=base_query,
+                )
+                if blocked_slug:
+                    return {
+                        "kind": "text",
+                        "message": _issue_prompt_for_platform(blocked_slug),
+                        "message_source": "platform_issue_prompt",
+                    }
                 args["platform"] = platform
                 known_os_version = (runtime_context.get("known_os_version") or "").strip().lower()
                 known_model = (runtime_context.get("known_model") or "").strip().lower()
@@ -1027,7 +1142,6 @@ async def generate_wati_reply(
                 )
                 if not str(args.get("os_version") or "").strip() and retrieval_version:
                     args["os_version"] = retrieval_version
-                base_query = str(args.get("user_query") or current_message or "").strip()
                 if (
                     (
                         _is_branch_change_short_reply(current_message)
