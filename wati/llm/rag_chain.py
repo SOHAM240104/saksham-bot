@@ -123,8 +123,8 @@ def retrieve_scam_docs(
     )
     filtered_docs = []
     for confidence, doc in ranked_docs[:4]:
-        doc.metadata = doc.metadata or {}
-        doc.metadata["confidence"] = confidence
+        doc.metadata = doc.metadata or {} 
+        doc.metadata["confidence"] = confidence 
         filtered_docs.append(doc)
 
     context = "\n\n".join([doc.page_content for doc in filtered_docs])
@@ -150,7 +150,7 @@ def search_scam_kb(user_query: str):
         if isinstance(confidence, (int, float)):
             confidences.append(float(confidence))
 
-    avg_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0
+    avg_confidence = (sum(confidences) / len(confidences)) if confidences else 0.0 # This is a calculation to get the average confidence score of the documents.
     return {
         "context": context,
         "sources": sources,

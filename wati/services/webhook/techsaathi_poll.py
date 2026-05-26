@@ -1,32 +1,4 @@
-"""TechSaathi polling — detect when a human agent closes a chat and return control to the bot.
-
-Problem this solves
--------------------
-When a user is handed off to a human (TechSaathi), our DB thread becomes
-``role=techsaathi, status=assigned``. The bot must stay silent until the agent
-closes the chat in WATI. WATI does not always send a webhook when that happens,
-so we poll their timeline API in the background.
-
-Two triggers (same WATI check, same DB transition)
---------------------------------------------------
-1. **Background poll** (``run_techsaathi_poll_loop``) — runs every ~3 min while
-   any conversation has an active techsaathi thread; catches closes even if the
-   user never messages again.
-2. **Incoming message** (``handle_techsaathi_incoming_message``) — runs at the
-   start of every webhook when the message landed on a techsaathi thread; if the
-   agent already closed, switch to bot immediately and send welcome buttons.
-
-On "resolved" (agent closed)
---------------------------
-- Mark techsaathi thread ``status=resolved``
-- Create a new ``role=chatbot, status=assigned`` thread
-- Send welcome + Tech/Scam buttons
-- Store the outbound WATI message id on the welcome Message row
-
-On "assigned" (human still active)
-----------------------------------
-- Bot stays silent (``human_active``); no classifier / LLM run.
-"""
+"""TechSaathi polling — detect when a human agent closes a chat and return control to the bot."""
 
 import asyncio
 import logging

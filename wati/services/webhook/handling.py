@@ -152,7 +152,7 @@ def _generate_wati_reply_in_thread(
     finally:
         db.close()
 
-
+# This function is used to stop the typing indicator.
 async def _stop_typing_indicator(
     typing_stop: asyncio.Event,
     typing_task: asyncio.Task,
@@ -163,11 +163,12 @@ async def _stop_typing_indicator(
         await typing_task
 
 
+# This function is used to get or create a user.
 def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
     digits = "".join(c for c in str(phone or "") if c.isdigit())
     p_91 = digits
     p_plus = f"+{digits}" if digits else ""
-    user = db.query(User).filter(User.phone_number.in_([p_plus, p_91])).first()
+    user = db.query(User).filter(User.phone_number.in_([p_plus, p_91])).first() 
     if user:
         return user
 
@@ -182,7 +183,7 @@ def _get_or_create_user(db, phone: str, first_name: str | None) -> User:
     db.flush()
     return user
 
-
+# This function is used to get or create a senior.
 def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
     senior = db.query(Senior).filter(Senior.user_id == user.id).first()
     if senior:
@@ -200,7 +201,7 @@ def _get_or_create_senior(db, user: User, first_name: str | None) -> Senior:
     db.flush()
     return senior
 
-
+# This function is used to create a subscription for a senior.
 def _subscription_sync(senior_id: int) -> None:
     db = SessionLocal()
     try:
@@ -329,7 +330,7 @@ def _persist_template_value(payload: dict, routed_message: str) -> str:  #need w
         return sel[:4000]
     return (str(payload.get("type") or "text").strip() or "text")[:4000]
 
-
+# This function is used to write in the db the incoming message.
 def _persist_incoming(phone: str, message: str, payload: dict):
     db = SessionLocal()
     now = datetime.now(UTC)
@@ -393,7 +394,7 @@ def _persist_incoming(phone: str, message: str, payload: dict):
 # =========================================================
 # UPDATE BOT RESPONSE
 # =========================================================
-
+# This function is used to update the bot response in the db.
 def _update_bot_response_sync(
     message_id: int,
     bot_response: str | None = None,
@@ -433,7 +434,7 @@ def _update_bot_response(
     message_source: str | None = None,
     confidence_score: float | None = None,
 ) -> None:
-    asyncio.create_task(
+    asyncio.create_task( 
         asyncio.to_thread(
             _update_bot_response_sync,
             message_id,
@@ -595,7 +596,7 @@ async def process_incoming_message(
     try:
         payload = payload or {}
         incoming_message = message
-        button_reply_id = _extract_button_reply_id(payload)
+        button_reply_id = _extract_button_reply_id(payload) #Quick-reply buttons arrive as structured payload, not plain text.
 
         override = None
 
@@ -614,7 +615,7 @@ async def process_incoming_message(
         message_id, thread_id, conversation_id, _created_new_thread = _persist_incoming(
             phone, incoming_message, payload
         )
-
+        # This is the default values for the intent result.
         intent_result = {}
         classified_intent = ""
         issue_followup_depth = 1
@@ -628,7 +629,8 @@ async def process_incoming_message(
 
         db = SessionLocal()
         try:
-            history_for_llm = _build_history_messages(
+            history_for_llm = _build_history_messages(       #LLM needs prior turns; built once per inbound message.
+
                 db, thread_id, message_id, incoming_message
             )
             db.commit()
@@ -700,7 +702,7 @@ async def process_incoming_message(
                 (bool(incoming_message.strip()) or bool(button_reply_id))
                 and not on_techsaathi_thread  # no intent LLM while on human thread
             )
-            if should_run_classifier:
+            if should_run_classifier:   #Run classifier only if there is text or button id, and not on_techsaathi_thread
                 intent_result = await asyncio.to_thread(
                     _classify_wati_turn_intent_in_thread,
                     thread_id,
@@ -710,6 +712,7 @@ async def process_incoming_message(
                     button_reply_id,
                     history_for_llm,
                 )
+                # Intent result is a dictionary with the intent, active_branch, same_issue_as_previous, is_unresolved_followup, issue_followup_depth.
 
                 classified_intent = (intent_result.get("intent") or "").strip().upper()
                 same_issue_as_previous = bool(intent_result.get("same_issue_as_previous"))
@@ -760,6 +763,7 @@ async def process_incoming_message(
                 same_issue_as_previous = True
                 issue_followup_depth = max(issue_followup_depth, 2)
             db = SessionLocal()
+            #Load previous message in thread; if last bot message was handoff confirmation → awaiting_handoff_confirm = True.
             try:
                 last_msg = (
                     db.query(Message)
@@ -785,7 +789,7 @@ async def process_incoming_message(
             finally:
                 db.close()
             if awaiting_handoff_confirm:
-                confirm_reply = _handoff_confirm_decision(incoming_message)
+                confirm_reply = _handoff_confirm_decision(incoming_message) #This is the decision on the handoff confirmation.
                 declined_handoff = confirm_reply == "NO"
             is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
             if scam_context:
@@ -1097,7 +1101,7 @@ async def process_incoming_message(
                             .order_by(desc(Message.created))
                             .first()
                         )
-                        if last_on_prev and "post_resolve_welcome" in (
+                        if last_on_prev and "post_resolve_welcome" in (  #If previous thread’s last message had post_resolve_welcome in source → post_resolve_welcome_sent=True.
                             last_on_prev.message_source or ""
                         ):
                             post_resolve_welcome_sent = True

@@ -295,14 +295,9 @@ def _is_on_tech_path(
     return False
 
 
-def _coerce_bool_field(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes"}
-    return bool(value)
 
 
+#branch change short replies
 _BRANCH_CHANGE_SHORT_REPLIES = frozenset(
     {"yes", "y", "yeah", "yep", "ha", "haan", "han", "ji", "ok", "okay", "sure", "no", "n", "nope", "nah", "nahi", "na", "not now", "continue"}
 )

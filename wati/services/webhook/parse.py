@@ -1,15 +1,15 @@
 import re
 from datetime import UTC, datetime
 
-
+# This function is used to check if the payload indicates that a human operator is involved in the conversation.
 def wati_payload_indicates_human_operator(payload: dict | None) -> bool:
     p = payload or {}
     if (p.get("operatorName") or "").strip():
         return True
     e = (p.get("operatorEmail") or "").strip().lower()
-    return bool(e) and "api-token-user" not in e
+    return bool(e) and "api-token-user" not in e  # This is a check to ensure that the operator email is not a bot email. another thing we can do is if the owner is true then we can return true.
 
-
+# This function is used to extract the name from the payload.
 def _extract_name(payload: dict) -> str | None:
     for key in ["senderName", "contactName", "name", "profileName"]:
         val = payload.get(key)
@@ -17,7 +17,7 @@ def _extract_name(payload: dict) -> str | None:
             return val.strip()[:512]
     return None
 
-
+# This function is used to normalize the scam OS button.
 def _normalize_scam_os_button(title: str | None = None, reply_id: str | None = None) -> str | None:
     """Map only explicit Scam Help OS button taps — never free-text keywords."""
     if isinstance(reply_id, str) and reply_id.strip():
@@ -31,7 +31,7 @@ def _normalize_scam_os_button(title: str | None = None, reply_id: str | None = N
             return "android"
     return None
 
-
+# This function is used to normalize the support button id.
 def _normalize_support_button_id(
     reply_id: str | None, title: str | None = None
 ) -> str | None:
@@ -63,7 +63,7 @@ def _normalize_support_button_id(
         return normalized
     return normalized
 
-
+# This function is used to extract the button reply id from the payload.
 def _extract_button_reply_id(payload: dict | None) -> str | None:
     raw = payload or {}
 
@@ -164,54 +164,44 @@ def _handoff_confirm_decision(text: str) -> str:
         return "NO"
     return "UNCLEAR"
 
-
+# This function is used to extract the timeline items from the response.
 def _timeline_items_from_response(data: dict) -> list:
-    """v1 getMessages uses messages.items; ext v3 used message_list."""
+    """v1 getMessages uses messages.items; """
     if not isinstance(data, dict):
         return []
-    msgs = data.get("messages")
+    msgs = data.get("messages") # This is the messages from the response.
     if isinstance(msgs, dict):
-        items = msgs.get("items")
+        items = msgs.get("items") # This is the items from the response.
         if isinstance(items, list):
             return items
-    raw = data.get("message_list")
+    raw = data.get("message_list") # This is the message list from the response.
     return raw if isinstance(raw, list) else []
 
 
-# ---------------------------------------------------------------------------
-# WATI timeline parsing (used by TechSaathi poll + incoming-message gate)
-#
-# WATI GET /getMessages returns a mixed timeline (messages + ticket events).
-# We only look at eventType=="ticket" rows and infer:
-#   "assigned" — human agent still has the chat (bot stays silent)
-#   "resolved" — agent closed/solved the ticket (bot can take over)
-#
-# We fetch only ~5 recent items, so logic must handle events scrolling out of
-# the window and multiple ticket ids for the same phone number.
-# ---------------------------------------------------------------------------
 
 
+# This function is used to parse the WATI created timestamp to UTC datetime for reliable comparisons.
 def _parse_wati_created(raw) -> datetime | None:
-    """Normalise WATI ``created`` to UTC datetime for reliable comparisons."""
+    """ WATI ``created`` to UTC datetime for reliable comparisons."""
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
         try:
-            return datetime.fromtimestamp(raw, tz=UTC)
+            return datetime.fromtimestamp(raw, tz=UTC) # This is the timestamp from the response.
         except (OSError, ValueError):
             return None
     text = str(raw).strip()
     if not text:
         return None
     if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
+        text = f"{text[:-1]}+00:00" # This is the formatted timestamp from the response.
     try:
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text) 
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    if parsed.tzinfo is None: 
+        return parsed.replace(tzinfo=UTC) 
+    return parsed.astimezone(UTC) #.astimezone(UTC) so all comparisons use one zone.
 
 
 def _timeline_ticket_id(item: dict) -> str:
@@ -238,10 +228,10 @@ def _timeline_item_fields(item: dict) -> tuple[str, str]:
     combined = " ".join(p for p in (ev_desc, detailed) if p).strip()
     return event_type, combined
 
-
+# This function is used to check if the event is a human assign event.
 def _is_human_assign_event(desc: str) -> bool:
     """True when a human agent (not the bot) took ownership of the chat."""
-    if "chat is now assigned to" in desc and "@" in desc:
+    if "chat is now assigned to" in desc and "@" in desc: #"chat is now assigned to" and "@" (agent email) → True.
         return True
     return (
         "assigned to" in desc
@@ -266,7 +256,7 @@ def _is_bot_reopen_event(desc: str) -> bool:
         return True
     return "chat has been initialized" in desc
 
-
+#Find the most recent close/reopen across all tickets in the snippet.
 def _latest_close_and_bot_reopen(
     ticket_events: list[dict],
 ) -> tuple[tuple[datetime, str] | None, tuple[datetime, str] | None]:
@@ -284,18 +274,7 @@ def _latest_close_and_bot_reopen(
 
 
 def parse_wati_timeline_for_thread(items: list) -> str:
-    """Decide if the human handoff is still active or finished.
-
-    Returns ``"assigned"`` (human still has chat) or ``"resolved"`` (agent closed).
-
-    HOW (high level):
-    1. Collect ticket events with parsed timestamps + ticket ids.
-    2. Find the latest human-assign event → that ticket is the active handoff.
-    3. On that ticket: if a close happened after assign → resolved.
-    4. Edge case: close on handoff ticket + bot init on a *different* ticket → resolved
-       (common when WATI opens a fresh bot ticket after the agent closes).
-    5. Default to ``assigned`` when unsure — safer to stay silent than interrupt human.
-    """
+    """Decide if the human handoff is still active or finished."""
     if not isinstance(items, list):
         return "assigned"
 
