@@ -6,13 +6,20 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 
 from app.models.chat.chat import Conversation, Message, Thread
+from app.models.chatbot.context import PlatformModel
 from app.models.senior import Senior
 from app.models.user import User
 from wati.llm.rag_chain import search_scam_kb, search_support_docs
 from wati.services.dynamic_copy import dynamic_copy
+from wati.services.supported_refinements import check_platform_refinement
+from wati.services.unresolved_flow import (
+    UNRESOLVED_PHASE_DIAGNOSTIC,
+    UNRESOLVED_PHASE_REFINED_RETRY,
+    retrieve_for_refined_unresolved_turn,
+)
 from wati.settings import settings
 
 logger = logging.getLogger("wati.services.conversation")
@@ -26,10 +33,35 @@ _PLATFORM_LIST_TEXT_ALIASES = frozenset(
     {
         "google pixel",
         "iphone / ipad",
+        "apple iphone / ipad",
         "redmi / poco",
         "galaxy",
+        "samsung galaxy",
     }
 )
+_PLATFORM_ISSUE_HINTS = re.compile(
+    r"\b(help|issue|problem|stuck|error|how|wallpaper|battery|wifi|cannot|can't|not working)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_platform_only_user_message(text: str, button_reply_id: str = "") -> bool:
+    """True when the user message is only a phone-brand list pick (not a tech issue)."""
+    btn = (button_reply_id or "").strip().lower()
+    if btn in PLATFORM_LIST_SELECTION_TOKENS:
+        return True
+    t = (text or "").strip().lower().rstrip(".!? ")
+    if t in PLATFORM_LIST_SELECTION_TOKENS or t in _PLATFORM_LIST_TEXT_ALIASES:
+        return True
+    slug = _platform_slug_from_turn(text, button_reply_id)
+    if slug not in SUPPORTED_PLATFORMS:
+        return False
+    if _PLATFORM_ISSUE_HINTS.search(t):
+        return False
+    # WhatsApp list rows are short brand labels (e.g. "Apple iPhone / iPad").
+    return len(t.split()) <= 6
+
+
 MAX_TOOL_STEPS = 2
 
 _SCAM_ENTRY_TOKENS = frozenset({"scam", "scam help"})
@@ -40,15 +72,6 @@ _SCAM_KB_TOOL_PREFIX = (
     "for warmth only).\n\n"
     "--- KNOWLEDGE BASE EXCERPTS ---\n"
 )
-
-
-def _is_platform_only_user_message(text: str, button_reply_id: str = "") -> bool:
-    """True when the user message is only a phone-brand list pick (not a tech issue)."""
-    btn = (button_reply_id or "").strip().lower()
-    if btn in PLATFORM_LIST_SELECTION_TOKENS:
-        return True
-    t = (text or "").strip().lower().rstrip(".!? ")
-    return t in PLATFORM_LIST_SELECTION_TOKENS or t in _PLATFORM_LIST_TEXT_ALIASES
 
 
 @tool("send_mode_buttons")
@@ -126,7 +149,13 @@ def _build_history_messages(db, thread_id: int, current_message_id: int, current
                 }
             )
         if bot_text:
-            history.append({"role": "assistant", "content": bot_text})
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": bot_text,
+                    "message_source": (msg.message_source or "").strip(),
+                }
+            )
 
     history.append({"role": "user", "content": (current_user_message or "").strip()})
     return history
@@ -469,8 +498,10 @@ def _phone_os_from_message_source(message_source: str) -> str:
 def _known_scam_phone_os(
     history: list[dict],
     button_reply_id: str = "",
+    *,
+    stored_platform: str = "",
 ) -> str:
-    """OS is set only by explicit iOS/Android button taps, persisted as scam_os:* on the message."""
+    """OS from iOS/Android taps, history scam_os:*, or inferred from stored platform."""
     if _is_scam_os_reply(button_reply_id):
         return (button_reply_id or "").strip().lower()
     for item in reversed(history):
@@ -479,7 +510,7 @@ def _known_scam_phone_os(
         os = _phone_os_from_message_source(item.get("message_source") or "")
         if os:
             return os
-    return ""
+    return _phone_os_from_platform_slug(stored_platform)
 
 
 def _user_has_described_scam_situation(
@@ -537,16 +568,117 @@ def _is_platform_list_selection_only(text: str) -> bool:
     return t in PLATFORM_LIST_SELECTION_TOKENS
 
 
-def _issue_prompt_for_platform(slug: str) -> str:
-    labels = {
-        "apple": "iPhone or iPad",
-        "samsung": "Samsung phone",
-        "pixel": "Pixel",
-        "oppo": "Oppo phone",
-        "xiaomi": "Xiaomi or Redmi phone",
+_PLATFORM_LABELS = {
+    "apple": "iPhone or iPad",
+    "samsung": "Samsung phone",
+    "pixel": "Pixel",
+    "oppo": "Oppo phone",
+    "xiaomi": "Xiaomi or Redmi phone",
+}
+
+
+def _platform_label(slug: str) -> str:
+    return _PLATFORM_LABELS.get((slug or "").strip().lower(), "phone")
+
+
+def _platform_os_refinement_hint(slug: str) -> str:
+    """Optional OS/model ask for Still Stuck follow-up — one clause, user may skip (RULE 5)."""
+    p = (slug or "").strip().lower()
+    hints = {
+        "apple": "iOS version from Settings > General > About",
+        "samsung": "Galaxy model and Android version from Settings > About phone",
+        "pixel": "Android version from Settings > About phone",
+        "oppo": "ColorOS version from Settings > About device",
+        "xiaomi": "HyperOS or Android version from Settings > About phone",
     }
-    device = labels.get((slug or "").strip().lower(), "phone")
-    return f"What issue are you having with your {device}?"
+    return hints.get(p, "phone software version from Settings > About phone or device")
+
+
+def _issue_prompt_for_platform(slug: str) -> str:
+    return f"What issue are you having with your {_platform_label(slug)}?"
+
+
+def _phone_os_from_platform_slug(slug: str) -> str:
+    p = (slug or "").strip().lower()
+    if p == "apple":
+        return "ios"
+    if p in {"samsung", "pixel", "oppo", "xiaomi"}:
+        return "android"
+    return ""
+
+
+def _platform_slug_from_user_turn(text: str, button_reply_id: str = "") -> str:
+    return _platform_slug_from_turn(text, button_reply_id)
+
+
+def _senior_for_thread(db, thread_id: int) -> Senior | None:
+    thread = db.query(Thread).filter(Thread.id == thread_id).first()
+    if not thread:
+        return None
+    conv = db.query(Conversation).filter(Conversation.id == thread.conversation_id).first()
+    if not conv or not conv.senior_id:
+        return None
+    return db.query(Senior).filter(Senior.id == conv.senior_id).first()
+
+
+def _platform_slug_from_senior(db, senior: Senior | None) -> str:
+    if not senior or not senior.device_id:
+        return ""
+    row = (
+        db.query(PlatformModel)
+        .filter(PlatformModel.id == senior.device_id)
+        .first()
+    )
+    slug = (row.identity or "").strip().lower() if row else ""
+    return slug if slug in SUPPORTED_PLATFORMS else ""
+
+
+def _platform_row_for_slug(db, slug: str) -> PlatformModel | None:
+    normalized = (slug or "").strip().lower()
+    if normalized not in SUPPORTED_PLATFORMS:
+        return None
+    # Supported phone brands may remain referenced while soft-deleted in admin.
+    return (
+        db.query(PlatformModel)
+        .filter(func.lower(PlatformModel.identity) == normalized)
+        .order_by(PlatformModel.is_deleted.asc(), PlatformModel.id.asc())
+        .first()
+    )
+
+
+def save_senior_platform_from_turn(
+    db, senior: Senior | None, text: str, button_reply_id: str = ""
+) -> str:
+    """Persist platform slug to senior.device_id; return slug or ""."""
+    if not senior:
+        return ""
+    slug = _platform_slug_from_turn(text, button_reply_id)
+    if slug not in SUPPORTED_PLATFORMS:
+        return ""
+    row = _platform_row_for_slug(db, slug)
+    if not row:
+        logger.warning("PlatformModel not found for slug=%s", slug)
+        return ""
+    senior.device_id = row.id
+    db.flush()
+    return slug
+
+
+def thread_has_platform_issue_prompt(
+    db, thread_id: int, *, exclude_message_id: int | None = None
+) -> bool:
+    query = db.query(Message).filter(
+        Message.thread_id == thread_id,
+        Message.is_deleted.is_(False),
+        Message.bot_response.isnot(None),
+    )
+    if exclude_message_id:
+        query = query.filter(Message.id != exclude_message_id)
+    rows = query.order_by(desc(Message.created)).limit(20).all()
+    for row in rows:
+        if "platform_issue_prompt" in (row.message_source or ""):
+            return True
+    return False
 
 
 def _recent_user_messages_snippet(history: list[dict], *, limit: int = 8) -> str:
@@ -711,6 +843,143 @@ def _looks_like_troubleshooting_steps(text: str) -> bool:
     return False
 
 
+def refinement_platform_for_turn(db, thread_id: int, history: list[dict]) -> str:
+    """Platform slug used for OS/model validation — DB device first, then chat history."""
+    senior = _senior_for_thread(db, thread_id)
+    slug = _platform_slug_from_senior(db, senior)
+    if slug:
+        return slug
+    ctx = _infer_runtime_context(history)
+    return (ctx.get("known_platform") or "").strip().lower()
+
+
+def _is_unresolved_negative_only(text: str, button_reply_id: str = "") -> bool:
+    """True when the user only signals the previous fix did not work (Still Stuck tap or equivalent)."""
+    btn = (button_reply_id or "").strip().lower()
+    if btn in {"not_resolved", "still_stuck"}:
+        return True
+    t = re.sub(r"\s+", " ", (text or "").strip().lower()).rstrip(".!? ")
+    if not t:
+        return False
+    short_phrases = (
+        "still stuck",
+        "not resolved",
+        "same issue",
+        "not working",
+        "didn't work",
+        "did not work",
+        "can't figure it out",
+        "cannot figure it out",
+        "still not working",
+    )
+    if t in short_phrases:
+        return True
+    if len(t) < 48 and any(phrase in t for phrase in short_phrases):
+        return True
+    return False
+
+
+def _prior_still_stuck_count(history: list[dict]) -> int:
+    """Count Still Stuck / not-resolved user turns before the latest message."""
+    items = history[:-1] if history else []
+    count = 0
+    for item in items:
+        if item.get("role") != "user":
+            continue
+        if _is_unresolved_negative_only(item.get("content") or "", ""):
+            count += 1
+    return count
+
+
+def _last_assistant_troubleshooting_from_history(history: list[dict]) -> str:
+    for item in reversed(history):
+        if item.get("role") != "assistant":
+            continue
+        content = (item.get("content") or "").strip()
+        if content and _looks_like_troubleshooting_steps(content):
+            return content
+    return ""
+
+
+def _unsupported_refinement_word(platform: str, refinement_type: str) -> str:
+    p = (platform or "").strip().lower()
+    if p == "samsung" or refinement_type == "model":
+        return "model"
+    return "version"
+
+
+def _unsupported_refinement_offer_reply(
+    *,
+    customer_name: str,
+    platform: str,
+    unsupported_label: str,
+    refinement_type: str,
+) -> dict:
+    text = dynamic_copy(
+        "unsupported_refinement_offer",
+        context={
+            "customer_name": (customer_name or "").strip(),
+            "platform_label": _platform_label(platform),
+            "platform_slug": (platform or "").strip().lower(),
+            "unsupported_label": (unsupported_label or "").strip(),
+            "refinement_word": _unsupported_refinement_word(platform, refinement_type),
+        },
+    )
+    return {
+        "kind": "text",
+        "message": (text or "").strip(),
+        "message_source": "unsupported_refinement_confirmation,dynamic_copy",
+    }
+
+
+def _unsupported_refinement_declined_reply(
+    *,
+    customer_name: str,
+    platform: str,
+) -> dict:
+    text = dynamic_copy(
+        "unsupported_refinement_declined",
+        context={
+            "customer_name": (customer_name or "").strip(),
+            "platform_label": _platform_label(platform),
+            "platform_slug": (platform or "").strip().lower(),
+        },
+    )
+    return {
+        "kind": "text",
+        "message": (text or "").strip(),
+        "message_source": "unsupported_refinement_declined,dynamic_copy",
+    }
+
+
+def _unresolved_diagnostic_reply(
+    *,
+    customer_name: str,
+    pending_user_issue: str,
+    platform: str,
+    prior_steps: str = "",
+) -> dict:
+    issue_summary = (pending_user_issue or "your phone issue").strip()[:200]
+    platform_slug = (platform or "").strip().lower()
+    os_refinement_hint = _platform_os_refinement_hint(platform_slug)
+    text = dynamic_copy(
+        "unresolved_diagnostic",
+        context={
+            "customer_name": (customer_name or "").strip(),
+            "issue_summary": issue_summary,
+            "platform_label": _platform_label(platform_slug),
+            "platform_slug": platform_slug,
+            "os_refinement_hint": os_refinement_hint,
+            "prior_steps_snippet": (prior_steps or "")[:400],
+        },
+    )
+    return {
+        "kind": "text",
+        "message": (text or "").strip(),
+        "message_source": "unresolved_diagnostic,dynamic_copy",
+    }
+
+
 def _name_for_thread(db, thread_id: int) -> str:
     thread = db.query(Thread).filter(Thread.id == thread_id).first()
     if not thread:
@@ -762,6 +1031,32 @@ def _infer_runtime_context(history: list[dict]) -> dict:
         "known_os_version": known_os_version,
         "known_model": known_model,
     }
+
+
+def _build_runtime_context(db, thread_id: int, history: list[dict]) -> dict:
+    chat_ctx = _infer_runtime_context(history)
+    senior = _senior_for_thread(db, thread_id)
+    stored_platform = _platform_slug_from_senior(db, senior)
+    needs_platform_pick = not bool(senior and senior.device_id)
+    retrieval_platform = stored_platform if stored_platform in SUPPORTED_PLATFORMS else ""
+    known_platform = retrieval_platform or (chat_ctx.get("known_platform") or "")
+    return {
+        **chat_ctx,
+        "known_platform": known_platform,
+        "stored_platform": stored_platform,
+        "needs_platform_pick": needs_platform_pick,
+        "retrieval_platform": retrieval_platform,
+    }
+
+
+def _user_switching_platform(
+    stored_platform: str,
+    current_message: str,
+    button_reply_id: str = "",
+) -> bool:
+    slug = _platform_slug_from_turn(current_message, button_reply_id)
+    stored = (stored_platform or "").strip().lower()
+    return bool(slug and stored and slug != stored)
 
 
 def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
@@ -872,7 +1167,7 @@ async def generate_wati_reply(
     history: list[dict] | None = None,
 ) -> dict:
     history = history or _build_history_messages(db, thread_id, current_message_id, current_message)
-    runtime_context = _infer_runtime_context(history)
+    runtime_context = _build_runtime_context(db, thread_id, history)
     customer_name = _name_for_thread(db, thread_id)
     turn_meta = turn_meta or {}
     button_reply_id = (turn_meta.get("button_reply_id") or "").strip().lower()
@@ -920,10 +1215,62 @@ async def generate_wati_reply(
         active_branch=active_branch,
     )
     known_phone_os = ""
+    stored_platform = (runtime_context.get("stored_platform") or "").strip().lower()
     if scam_mode and not on_tech_path:
-        known_phone_os = _known_scam_phone_os(history, button_reply_id)
+        known_phone_os = _known_scam_phone_os(
+            history,
+            button_reply_id,
+            stored_platform=stored_platform,
+        )
 
     unresolved_signal = bool(turn_meta.get("unresolved_signal_current_turn"))
+    unresolved_rounds = int(turn_meta.get("unresolved_rounds") or 0)
+    unresolved_phase = (turn_meta.get("unresolved_phase") or "none").strip().lower()
+    use_platform_only_retrieval = bool(turn_meta.get("use_platform_only_retrieval"))
+    runtime_context["use_platform_only_retrieval"] = use_platform_only_retrieval
+    runtime_context["unresolved_phase"] = unresolved_phase
+    if use_platform_only_retrieval:
+        runtime_context["known_os_version"] = ""
+        runtime_context["known_model"] = ""
+
+    refinement_platform = (
+        runtime_context.get("retrieval_platform")
+        or runtime_context.get("stored_platform")
+        or runtime_context.get("known_platform")
+        or refinement_platform_for_turn(db, thread_id, history)
+        or ""
+    ).strip().lower()
+    runtime_context["unresolved_rounds"] = unresolved_rounds
+    runtime_context["unresolved_signal_current_turn"] = unresolved_signal
+    if (
+        on_tech_path
+        and not scam_mode
+        and refinement_platform
+        and not use_platform_only_retrieval
+    ):
+        refinement_check = check_platform_refinement(current_message, refinement_platform)
+        if refinement_check.get("status") == "unsupported":
+            return _unsupported_refinement_offer_reply(
+                customer_name=customer_name,
+                platform=refinement_platform,
+                unsupported_label=refinement_check.get("label") or "",
+                refinement_type=refinement_check.get("refinement_type") or "",
+            )
+
+    if unresolved_phase == UNRESOLVED_PHASE_DIAGNOSTIC:
+        prior_steps = _last_assistant_troubleshooting_from_history(history)
+        return _unresolved_diagnostic_reply(
+            customer_name=customer_name,
+            pending_user_issue=pending_user_issue,
+            platform=(
+                runtime_context.get("retrieval_platform")
+                or runtime_context.get("stored_platform")
+                or runtime_context.get("known_platform")
+                or ""
+            ),
+            prior_steps=prior_steps,
+        )
+
     platform_issue_slug = _should_ask_tech_issue_before_retrieval(
         on_tech_path=on_tech_path,
         scam_mode=scam_mode,
@@ -985,15 +1332,20 @@ async def generate_wati_reply(
                 f"prior_turns_snippet: {prior_turns_snippet or 'none'}\n"
                 f"support_mode: {support_mode or 'none'}\n"
                 f"known_platform: {runtime_context.get('known_platform') or 'unknown'}\n"
+                f"stored_platform: {runtime_context.get('stored_platform') or 'none'}\n"
+                f"needs_platform_pick: {str(runtime_context.get('needs_platform_pick')).lower()}\n"
+                f"retrieval_platform: {runtime_context.get('retrieval_platform') or 'none'}\n"
                 f"known_phone_os: {known_phone_os or 'unknown'}\n"
                 f"known_os_version: {runtime_context.get('known_os_version') or 'unknown'}\n"
                 f"known_model: {runtime_context.get('known_model') or 'unknown'}\n"
+                f"use_platform_only_retrieval: {str(use_platform_only_retrieval).lower()}\n"
                 f"customer_name: {customer_name or 'unknown'}\n"
                 f"latest_user_message: {(current_message or '').strip() or 'none'}\n"
                 f"recent_user_messages:\n{recent_user_messages}\n"
                 f"button_reply_id: {runtime_context.get('button_reply_id') or 'none'}\n"
                 f"unresolved_signal_current_turn: {runtime_context.get('unresolved_signal_current_turn')}\n"
                 f"unresolved_rounds: {runtime_context.get('unresolved_rounds')}\n"
+                f"unresolved_phase: {unresolved_phase or 'none'}\n"
                 f"bank_helpline_url: {bank_helpline_url or 'none'}\n"
                 f"scam_mode_active: {str(scam_mode).lower()}\n"
                 f"active_branch: {(turn_meta.get('active_branch') or support_mode or 'infer_from_history')}\n"
@@ -1014,7 +1366,9 @@ async def generate_wati_reply(
                 "When known_phone_os is ios: never suggest APK sideloading or Android-only app install steps; iPhones use App Store only — for fake apps use delete app / Settings > General > iPhone Storage, or remove unknown configuration profiles.\n"
                 "When known_phone_os is android: APK/fake-app guidance from scam flow applies (do not open, uninstall via Settings > Apps).\n"
                 "Do not re-ask iOS vs Android once known_phone_os is set.\n"
-                "known_phone_os is set ONLY from explicit iOS/Android button taps — never infer from typed phone brand or model.\n"
+                "When stored_platform is set (device saved in DB), infer known_phone_os: apple→ios, samsung/pixel/oppo/xiaomi→android; do not show iOS/Android buttons.\n"
+                "search_support_docs MUST use retrieval_platform from runtime context (from device_id in DB); never override with chat-inferred brand.\n"
+                "Do not call send_platform_buttons when stored_platform is set unless needs_platform_pick is true or user switched phone.\n"
                 "When the user has described their situation: MUST call search_scam_kb first, then <scam_unified_flow> (comfort → category → MO; contextual check — not always money/OTP).\n"
                 "Complaint (1930): plain text REPORT/HOW TO FILE only; end with one warm natural line offering prevention tips (no 'reply yes'). If user clearly wants tips: search_scam_kb(prevention) then PREVENTION in plain text.\n"
                 "Never repeat prior-thread welcome-back text when entering scam help or when the user already described a scam in this thread.\n"
@@ -1022,12 +1376,10 @@ async def generate_wati_reply(
                 "When on scam path and user asks for human: RULE 7b — brief acknowledgment only.\n"
                 "When fresh_chatbot_thread is true and post_resolve_welcome_sent is true: system already sent prior_welcome_blend + Tech/Scam buttons — do NOT send_mode_buttons or repeat welcome on greeting-only.\n"
                 "When fresh_chatbot_thread is true and post_resolve_welcome_sent is false and greeting-only: prior_welcome_blend may be used in send_mode_buttons (human handoff return).\n"
-                "When unresolved_signal_current_turn is true and support_mode is not scam and latest user message is unresolved-negative only (e.g., still stuck/not working/same issue/can't figure it out), apply NEGATIVE FOLLOW-UP GATE.\n"
-                "In that gate: ask exactly one follow-up diagnostic question; do not call search_support_docs; do not call send_feedback_buttons; do not provide troubleshooting steps in this turn.\n"
-                "Ask platform-specific refinement first when missing (Apple: iOS/iPadOS, Samsung: model, Pixel: Android, Oppo: ColorOS, Xiaomi: HyperOS/Android), then wait for user reply.\n"
-                "For Oppo unresolved follow-ups, do not ask phone model; ask ColorOS version first.\n"
-                "If latest user message includes concrete new technical detail, still ask one high-value refinement question first and wait for user reply before retrieval.\n"
-                "If latest user message contains an unsupported phone brand, respond in plain text with supported brands and one continuation question; do not call send_platform_buttons.\n"
+                "When unresolved_phase is diagnostic, the system owns that turn — you are not invoked.\n"
+                "When unresolved_phase is refined_retry, search_support_docs is pre-loaded — call send_feedback_buttons only, using the same STEP STYLE as first-pass fixes (RULE 1/6); include one short line on what is different; do not ask diagnostic questions or call search_support_docs again.\n"
+                "When use_platform_only_retrieval is true: call search_support_docs with retrieval_platform only — omit os_version and device model.\n"
+                "When user gave an unsupported OS/model/version, system asks Yes/No for general platform-only steps — do not retrieve until they confirm Yes.\n"
                 "</runtime_context>"
             )
         ),
@@ -1037,6 +1389,58 @@ async def generate_wati_reply(
     had_search_support_this_turn = False
     had_search_scam_this_turn = False
     on_scam_path = scam_mode
+    refined_retry_preloaded = False
+
+    if unresolved_phase == UNRESOLVED_PHASE_REFINED_RETRY:
+        retrieval = retrieve_for_refined_unresolved_turn(
+            history=history,
+            current_message=current_message,
+            pending_user_issue=pending_user_issue,
+            platform=refinement_platform,
+            use_platform_only_retrieval=use_platform_only_retrieval,
+        )
+        if retrieval.get("kind"):
+            return retrieval
+        tool_call_id = "refined-retry-search"
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_support_docs",
+                        "args": {
+                            "user_query": (pending_user_issue or current_message or "").strip()
+                        },
+                        "id": tool_call_id,
+                    }
+                ],
+            )
+        )
+        messages.append(
+            ToolMessage(
+                content=(retrieval.get("context") or ""),
+                tool_call_id=tool_call_id,
+                name="search_support_docs",
+            )
+        )
+        messages.append(
+            HumanMessage(
+                content=(
+                    "The user replied after a Still Stuck diagnostic with refinement details. "
+                    "search_support_docs results are above. Call send_feedback_buttons NOW with "
+                    "updated troubleshooting steps using the same STEP STYLE as first-pass fixes "
+                    "(numbered conversational steps, optional intro with customer_name, check-in per RULE 6). "
+                    "Include one short line on what is different from prior steps. "
+                    "Do NOT call search_support_docs again. Do NOT ask diagnostic questions."
+                )
+            )
+        )
+        retrieval_sources = list(retrieval.get("sources") or [])
+        confidence = retrieval.get("confidence_score")
+        if isinstance(confidence, (int, float)):
+            retrieval_confidence = float(confidence)
+        had_search_support_this_turn = True
+        refined_retry_preloaded = True
 
     for _ in range(MAX_TOOL_STEPS):
         on_scam_path = _effective_scam_path(
@@ -1071,7 +1475,12 @@ async def generate_wati_reply(
                     "kind": "action",
                     "action": "feedback_buttons",
                     "message": text,
-                    "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                    "message_source": ",".join(
+                        (["refined_unresolved"] if refined_retry_preloaded else [])
+                        + retrieval_sources
+                    )
+                    if (refined_retry_preloaded or retrieval_sources)
+                    else "",
                     "confidence_score": retrieval_confidence,
                 }
             if on_scam_path:
@@ -1092,6 +1501,19 @@ async def generate_wati_reply(
             tool_call_id = tool_call.get("id", "tool-call")
 
             if tool_name == "search_support_docs":
+                platform = (runtime_context.get("retrieval_platform") or "").strip().lower()
+                if refined_retry_preloaded:
+                    messages.append(
+                        ToolMessage(
+                            content=(
+                                "Search already completed for this refined Still Stuck retry. "
+                                "Call send_feedback_buttons with updated steps."
+                            ),
+                            tool_call_id=tool_call_id,
+                            name="search_support_docs",
+                        )
+                    )
+                    continue
                 if on_scam_path:
                     messages.append(
                         ToolMessage(
@@ -1104,10 +1526,7 @@ async def generate_wati_reply(
                         )
                     )
                     continue
-                platform = str(args.get("platform") or "").strip().lower()
                 if not platform:
-                    platform = (runtime_context.get("known_platform") or "").strip().lower()
-                if not platform or platform not in SUPPORTED_PLATFORMS:
                     return {
                         "kind": "action",
                         "action": "platform_buttons",
@@ -1132,6 +1551,20 @@ async def generate_wati_reply(
                 args["platform"] = platform
                 known_os_version = (runtime_context.get("known_os_version") or "").strip().lower()
                 known_model = (runtime_context.get("known_model") or "").strip().lower()
+                if use_platform_only_retrieval:
+                    known_os_version = ""
+                    known_model = ""
+                elif platform:
+                    refinement_check = check_platform_refinement(
+                        current_message, platform
+                    )
+                    if refinement_check.get("status") == "unsupported":
+                        return _unsupported_refinement_offer_reply(
+                            customer_name=customer_name,
+                            platform=platform,
+                            unsupported_label=refinement_check.get("label") or "",
+                            refinement_type=refinement_check.get("refinement_type") or "",
+                        )
                 retrieval_os, retrieval_version = _map_retrieval_os_and_version(
                     platform, known_os_version, known_model
                 )
@@ -1155,6 +1588,8 @@ async def generate_wati_reply(
                     hint_lines.append(f"device_model: {known_model}")
                 if hint_lines:
                     args["user_query"] = f"{base_query}\n" + "\n".join(hint_lines)
+                elif base_query != str(args.get("user_query") or "").strip():
+                    args["user_query"] = base_query
                 try:
                     result = search_support_docs.invoke(args)
                 except Exception:
@@ -1257,13 +1692,25 @@ async def generate_wati_reply(
                         retrieval_sources if had_search_scam_this_turn else None,
                     )
                 msg = (args.get("message") or "").strip()
-                known_platform = (runtime_context.get("known_platform") or "").strip().lower()
-                if known_platform in SUPPORTED_PLATFORMS:
+                needs_platform_pick = bool(runtime_context.get("needs_platform_pick"))
+                stored_platform = (runtime_context.get("stored_platform") or "").strip().lower()
+                switching = _user_switching_platform(
+                    stored_platform, current_message, button_reply_id
+                )
+                if stored_platform in SUPPORTED_PLATFORMS and not needs_platform_pick and not switching:
                     return {
                         "kind": "text",
                         "message": msg,
                         "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
                     }
+                if not needs_platform_pick and not switching:
+                    known_platform = (runtime_context.get("known_platform") or "").strip().lower()
+                    if known_platform in SUPPORTED_PLATFORMS:
+                        return {
+                            "kind": "text",
+                            "message": msg,
+                            "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                        }
                 return {
                     "kind": "action",
                     "action": "platform_buttons",
@@ -1288,7 +1735,12 @@ async def generate_wati_reply(
                     "kind": "action",
                     "action": "feedback_buttons",
                     "message": msg,
-                    "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                    "message_source": ",".join(
+                        (["refined_unresolved"] if refined_retry_preloaded else [])
+                        + retrieval_sources
+                    )
+                    if (refined_retry_preloaded or retrieval_sources)
+                    else "",
                 }
                 if had_search_support_this_turn:
                     result["confidence_score"] = retrieval_confidence
@@ -1311,7 +1763,12 @@ async def generate_wati_reply(
                 "kind": "action",
                 "action": "feedback_buttons",
                 "message": text,
-                "message_source": ",".join(retrieval_sources) if retrieval_sources else "",
+                "message_source": ",".join(
+                    (["refined_unresolved"] if refined_retry_preloaded else [])
+                    + retrieval_sources
+                )
+                if (refined_retry_preloaded or retrieval_sources)
+                else "",
                 "confidence_score": retrieval_confidence,
             }
         if on_scam_path and text:

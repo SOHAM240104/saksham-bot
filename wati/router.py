@@ -54,11 +54,15 @@ async def _handle_incoming(request: Request, background_tasks: BackgroundTasks) 
         return {"status": "ignored", "event": event_name}
 
     phone = payload.get("waId")
-    message = str(payload.get("text") or "").strip()
+    message = ""
+    list_reply = payload.get("listReply")
+    if isinstance(list_reply, dict):
+        message = str(list_reply.get("title") or "").strip()
     if not message:
-        list_reply = payload.get("listReply")
+        message = str(payload.get("text") or "").strip()
+    if not message:
         if isinstance(list_reply, dict):
-            message = str(list_reply.get("title") or "").strip()
+            message = str(list_reply.get("description") or "").strip()
     if not message:
         interactive_btn = payload.get("interactiveButtonReply")
         if isinstance(interactive_btn, dict):

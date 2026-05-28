@@ -75,6 +75,32 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
             "whether they use iPhone/iPad or Android so guidance can match their phone. "
             "Plain text only; do not ask what happened yet."
         ),
+        "platform_still_using": (
+            "Ask if the user is still using their phone described by platform_label in context; "
+            "mention platform_label naturally; end with a clear Yes or No question."
+        ),
+        "platform_issue_ask": (
+            "User confirmed they are still on the same phone (platform_label in context). "
+            "Ask one warm open question about what issue or problem they need help with on that phone."
+        ),
+        "unresolved_diagnostic": (
+            "User says previous troubleshooting steps did not work (Still Stuck). "
+            "Write ONE warm combined sentence only: (1) ask what step failed or what they saw instead "
+            "for issue_summary on platform_label; (2) append optional clause using os_refinement_hint "
+            "from context exactly — e.g. 'If you can, please share your [hint]; if not, no problem.' "
+            "Use customer_name as '<Name> Ji' when provided. Do NOT provide numbered steps. Do NOT ask Yes or No."
+        ),
+        "unsupported_refinement_offer": (
+            "User gave an OS/model/version not in our guides for platform_label. "
+            "Write exactly TWO short sentences in plain text: "
+            "(1) say we do not have troubleshooting for unsupported_label on platform_label; "
+            "(2) ask if they want general steps for platform_label without that refinement_word "
+            "(use refinement_word from context — 'version' or 'model'); end with Please reply Yes or No."
+        ),
+        "unsupported_refinement_declined": (
+            "User declined general platform-only steps after an unsupported OS/model/version. "
+            "One warm sentence: no problem, they can share a supported version/model later or describe a new issue."
+        ),
     }
     fallback = {
         "handoff_wait": "I'm connecting you to a human support agent now. Please wait a moment.",
@@ -96,6 +122,22 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "scam_os_prompt": (
             "To guide you better, is your phone an iPhone/iPad or Android?"
         ),
+        "platform_still_using": (
+            "Are you still using the same phone? Please reply Yes or No."
+        ),
+        "platform_issue_ask": (
+            "What issue are you having with your phone today?"
+        ),
+        "unresolved_diagnostic": (
+            "What step didn't work, or what did you see instead when you tried those steps?"
+        ),
+        "unsupported_refinement_offer": (
+            "I don't have troubleshooting for that on your phone. "
+            "Would you like me to try general steps without that version? Please reply Yes or No."
+        ),
+        "unsupported_refinement_declined": (
+            "No problem — if you share a supported version or model later, I can help with more specific steps."
+        ),
     }
     try:
         user_payload = {"goal": goals.get(kind, ""), "context": context}
@@ -110,4 +152,26 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
             return txt
     except Exception:
         logger.exception("Dynamic copy generation failed kind=%s", kind)
+    if kind == "unresolved_diagnostic":
+        hint = (context.get("os_refinement_hint") or "").strip()
+        name = (context.get("customer_name") or "").strip()
+        prefix = f"{name} ji, " if name else ""
+        base = (
+            f"{prefix}what step didn't work or what did you see instead when you tried "
+            f"to fix {context.get('issue_summary') or 'this'}?"
+        )
+        if hint:
+            return f"{base} If you can, please share your {hint}; if not, no problem."
+        return base
+    if kind == "unsupported_refinement_offer":
+        label = (context.get("unsupported_label") or "that").strip()
+        platform_label = (context.get("platform_label") or "your phone").strip()
+        word = (context.get("refinement_word") or "version").strip()
+        name = (context.get("customer_name") or "").strip()
+        prefix = f"{name} ji, " if name else ""
+        return (
+            f"{prefix}I don't have troubleshooting guides for {label} on {platform_label}. "
+            f"Would you like me to try general steps for your {platform_label} without that {word}? "
+            "Please reply Yes or No."
+        )
     return fallback.get(kind, "How can I help you?")

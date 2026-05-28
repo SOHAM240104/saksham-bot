@@ -32,6 +32,46 @@ def _normalize_scam_os_button(title: str | None = None, reply_id: str | None = N
     return None
 
 # This function is used to normalize the support button id.
+# WATI list row ids (when custom row ids are replaced by index ids like "0-0").
+_WATI_LIST_ROW_ID_TO_SLUG = {
+    "0-0": "apple",
+    "0-1": "samsung",
+    "0-2": "pixel",
+    "0-3": "oppo",
+    "0-4": "xiaomi",
+}
+
+
+def _slug_from_platform_list_row(
+    title: str | None = None,
+    reply_id: str | None = None,
+    description: str | None = None,
+) -> str | None:
+    """Map WhatsApp platform list row fields to a supported platform slug."""
+    if isinstance(reply_id, str) and reply_id.strip():
+        mapped = _WATI_LIST_ROW_ID_TO_SLUG.get(reply_id.strip().lower())
+        if mapped:
+            return mapped
+        if reply_id.strip().lower() in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
+            return reply_id.strip().lower()
+    candidates: list[str] = []
+    for raw in (title, description):
+        if isinstance(raw, str) and raw.strip():
+            candidates.append(raw.strip().lower())
+    for candidate in candidates:
+        if candidate in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
+            return candidate
+        if "iphone" in candidate or "ipad" in candidate:
+            return "apple"
+        if "galaxy" in candidate:
+            return "samsung"
+        if "pixel" in candidate or "google pixel" in candidate:
+            return "pixel"
+        if "redmi" in candidate or "poco" in candidate:
+            return "xiaomi"
+    return None
+
+
 def _normalize_support_button_id(
     reply_id: str | None, title: str | None = None
 ) -> str | None:
@@ -70,15 +110,15 @@ def _extract_button_reply_id(payload: dict | None) -> str | None:
     list_reply = raw.get("listReply")
     if isinstance(list_reply, dict):
         title = list_reply.get("title")
-        if isinstance(title, str) and title.strip():
-            normalized_title = title.strip().lower()
-            if normalized_title in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized_title
+        description = list_reply.get("description") or list_reply.get("desription")
         reply_id = list_reply.get("id")
-        if isinstance(reply_id, str) and reply_id.strip():
-            normalized = reply_id.strip().lower()
-            if normalized in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
-                return normalized
+        mapped = _slug_from_platform_list_row(
+            title if isinstance(title, str) else None,
+            reply_id if isinstance(reply_id, str) else None,
+            description if isinstance(description, str) else None,
+        )
+        if mapped:
+            return mapped
 
     interactive_button_reply = raw.get("interactiveButtonReply")
     if isinstance(interactive_button_reply, dict):
@@ -154,7 +194,7 @@ def _is_handoff_confirmation_message(text: str) -> bool:
     return has_confirm and has_human
 
 
-def _handoff_confirm_decision(text: str) -> str:
+def _yes_no_confirm_decision(text: str) -> str:
     msg = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
     yes_tokens = {"yes", "y", "haan", "ha", "ok", "okay", "sure", "connect", "transfer"}
     no_tokens = {"no", "n", "nah", "nope", "not now", "dont", "don't", "later"}
@@ -163,6 +203,10 @@ def _handoff_confirm_decision(text: str) -> str:
     if any(tok in msg for tok in no_tokens):
         return "NO"
     return "UNCLEAR"
+
+
+def _handoff_confirm_decision(text: str) -> str:
+    return _yes_no_confirm_decision(text)
 
 # This function is used to extract the timeline items from the response.
 def _timeline_items_from_response(data: dict) -> list:

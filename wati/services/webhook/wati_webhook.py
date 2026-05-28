@@ -349,11 +349,11 @@ async def send_interactive_platform_list_message(phone: str, message: str) -> bo
             {
                 "title": "Supported phones",
                 "rows": [
-                    {"title": "Apple", "description": "iPhone / iPad"},
-                    {"title": "Samsung", "description": "Galaxy"},
-                    {"title": "Pixel", "description": "Google Pixel"},
-                    {"title": "Oppo", "description": ""},
-                    {"title": "Xiaomi", "description": "Redmi / POCO"},
+                    {"id": "apple", "title": "Apple", "description": "iPhone / iPad"},
+                    {"id": "samsung", "title": "Samsung", "description": "Galaxy"},
+                    {"id": "pixel", "title": "Pixel", "description": "Google Pixel"},
+                    {"id": "oppo", "title": "Oppo", "description": ""},
+                    {"id": "xiaomi", "title": "Xiaomi", "description": "Redmi / POCO"},
                 ],
             }
         ],

@@ -14,20 +14,35 @@ from app.models.subscriptions import Subscription, SubscriptionPlan
 from app.models.user import User
 from wati.services.conversation import (
     _build_history_messages,
+    _is_on_tech_path,
+    _is_platform_only_user_message,
+    _name_for_thread,
+    _pending_user_issue_from_history,
+    _platform_label,
+    _platform_slug_from_senior,
     _prior_thread_snapshot,
+    _unsupported_refinement_declined_reply,
+    _unsupported_refinement_offer_reply,
     classify_wati_turn_intent,
     conversation_control,
     generate_wati_reply,
+    refinement_platform_for_turn,
     resolve_scam_context_from_turn,
+    save_senior_platform_from_turn,
+    thread_has_platform_issue_prompt,
+    _platform_slug_from_turn,
+    _prior_still_stuck_count,
 )
+from wati.services.supported_refinements import check_platform_refinement
+from wati.services.unresolved_flow import resolve_unresolved_phase
 from wati.services.dynamic_copy import dynamic_copy as _dynamic_copy
 from wati.settings import settings
 
 from .parse import (
     _extract_button_reply_id,
     _extract_name,
-    _handoff_confirm_decision,
     _is_handoff_confirmation_message,
+    _yes_no_confirm_decision,
     wati_payload_indicates_human_operator,
 )
 # Free-tier thread limit (disabled )
@@ -623,7 +638,15 @@ async def process_incoming_message(
         is_unresolved_followup = False
         history_for_llm: list[dict] | None = None
         awaiting_handoff_confirm = False
+        awaiting_platform_confirm = False
+        awaiting_unsupported_refinement_confirm = False
         confirm_reply = ""
+        platform_confirm_reply = ""
+        unsupported_refinement_reply = ""
+        use_platform_only_retrieval = False
+        last_bot_response = ""
+        last_bot_message_source = ""
+        platform_saved_slug = ""
         declined_handoff = False
         ask_handoff_confirmation = False
 
@@ -633,6 +656,26 @@ async def process_incoming_message(
 
                 db, thread_id, message_id, incoming_message
             )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+            senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+            if senior and _is_platform_only_user_message(incoming_message, button_reply_id or ""):
+                picked_slug = save_senior_platform_from_turn(
+                    db, senior, incoming_message, button_reply_id or ""
+                )
+                if not picked_slug:
+                    picked_slug = _platform_slug_from_turn(
+                        incoming_message, button_reply_id or ""
+                    )
+                platform_saved_slug = picked_slug
             db.commit()
         except Exception:
             db.rollback()
@@ -761,7 +804,8 @@ async def process_incoming_message(
             if button_reply_id == "not_resolved":
                 is_unresolved_followup = True
                 same_issue_as_previous = True
-                issue_followup_depth = max(issue_followup_depth, 2)
+                prior_still_stuck = _prior_still_stuck_count(history_for_llm or [])
+                issue_followup_depth = max(issue_followup_depth, prior_still_stuck + 2)
             db = SessionLocal()
             #Load previous message in thread; if last bot message was handoff confirmation → awaiting_handoff_confirm = True.
             try:
@@ -782,6 +826,17 @@ async def process_incoming_message(
                         or _is_handoff_confirmation_message(last_msg.bot_response or "")
                     )
                 )
+                awaiting_platform_confirm = bool(
+                    last_msg
+                    and (last_msg.message_source or "").strip() == "platform_confirmation"
+                )
+                awaiting_unsupported_refinement_confirm = bool(
+                    last_msg
+                    and "unsupported_refinement_confirmation"
+                    in (last_msg.message_source or "")
+                )
+                last_bot_response = (last_msg.bot_response or "").strip() if last_msg else ""
+                last_bot_message_source = (last_msg.message_source or "").strip() if last_msg else ""
                 db.commit()
             except Exception:
                 db.rollback()
@@ -789,8 +844,18 @@ async def process_incoming_message(
             finally:
                 db.close()
             if awaiting_handoff_confirm:
-                confirm_reply = _handoff_confirm_decision(incoming_message) #This is the decision on the handoff confirmation.
+                confirm_reply = _yes_no_confirm_decision(incoming_message)
                 declined_handoff = confirm_reply == "NO"
+            if awaiting_platform_confirm:
+                platform_confirm_reply = _yes_no_confirm_decision(incoming_message)
+            if awaiting_unsupported_refinement_confirm:
+                unsupported_refinement_reply = _yes_no_confirm_decision(incoming_message)
+                if unsupported_refinement_reply == "YES":
+                    use_platform_only_retrieval = True
+                    issue_followup_depth = max(issue_followup_depth, 3)
+                    is_unresolved = False
+                elif unsupported_refinement_reply == "NO":
+                    is_unresolved = False
             is_unresolved = button_reply_id == "not_resolved" or is_unresolved_followup
             if scam_context:
                 is_unresolved = False
@@ -947,6 +1012,43 @@ async def process_incoming_message(
                 )
                 return
 
+            if awaiting_unsupported_refinement_confirm:
+                db = SessionLocal()
+                try:
+                    user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+                    senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+                    stored_slug = _platform_slug_from_senior(db, senior)
+                    customer_name = _name_for_thread(db, thread_id)
+                finally:
+                    db.close()
+                if unsupported_refinement_reply == "UNCLEAR":
+                    confirm_text = last_bot_response or (
+                        "Would you like me to try general steps without that version? "
+                        "Please reply Yes or No."
+                    )
+                    await send_message(phone, confirm_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=confirm_text,
+                        message_source="unsupported_refinement_confirmation,dynamic_copy",
+                        confidence_score=None,
+                    )
+                    return
+                if unsupported_refinement_reply == "NO":
+                    declined = _unsupported_refinement_declined_reply(
+                        customer_name=customer_name,
+                        platform=stored_slug,
+                    )
+                    decline_text = (declined.get("message") or "").strip()
+                    await send_message(phone, decline_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=decline_text,
+                        message_source="unsupported_refinement_declined,dynamic_copy",
+                        confidence_score=None,
+                    )
+                    return
+
             if handoff_needed:
                 teams = ["support"]
                 base = settings.WATI_API_ENDPOINT.rstrip("/")
@@ -1052,6 +1154,186 @@ async def process_incoming_message(
                 )
                 return
 
+            if platform_saved_slug:
+                on_tech_path_now = _is_on_tech_path(
+                    support_mode,
+                    incoming_message,
+                    button_reply_id or "",
+                    active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+                )
+                pending_issue = _pending_user_issue_from_history(
+                    history_for_llm or [],
+                    incoming_message,
+                    button_reply_id or "",
+                )
+                if on_tech_path_now and not scam_context and not pending_issue:
+                    db = SessionLocal()
+                    try:
+                        customer_name = _name_for_thread(db, thread_id)
+                    finally:
+                        db.close()
+                    issue_text = _dynamic_copy(
+                        "platform_issue_ask",
+                        context={
+                            "platform_label": _platform_label(platform_saved_slug),
+                            "customer_name": customer_name,
+                        },
+                    )
+                    await send_message(phone, issue_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=issue_text,
+                        message_source="platform_issue_prompt,dynamic_copy",
+                        confidence_score=None,
+                    )
+                    return
+
+            if awaiting_platform_confirm:
+                db = SessionLocal()
+                try:
+                    user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+                    senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+                    stored_slug = _platform_slug_from_senior(db, senior)
+                    customer_name = _name_for_thread(db, thread_id)
+                finally:
+                    db.close()
+                copy_ctx = {
+                    "platform_label": _platform_label(stored_slug),
+                    "customer_name": customer_name,
+                }
+                if platform_confirm_reply == "UNCLEAR":
+                    confirm_text = _dynamic_copy("platform_still_using", context=copy_ctx)
+                    await send_message(phone, confirm_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=confirm_text,
+                        message_source="platform_confirmation",
+                        confidence_score=None,
+                    )
+                    return
+                if platform_confirm_reply == "NO":
+                    list_msg = _default_button_message("platform_buttons")
+                    await send_interactive_platform_list_message(phone, list_msg)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=list_msg,
+                        message_source="platform_list",
+                        confidence_score=None,
+                    )
+                    return
+                if platform_confirm_reply == "YES":
+                    issue_text = _dynamic_copy("platform_issue_ask", context=copy_ctx)
+                    await send_message(phone, issue_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=issue_text,
+                        message_source="platform_issue_prompt,dynamic_copy",
+                        confidence_score=None,
+                    )
+                    return
+
+            if (
+                not scam_context
+                and not awaiting_handoff_confirm
+                and not awaiting_platform_confirm
+                and not awaiting_unsupported_refinement_confirm
+                and not use_platform_only_retrieval
+            ):
+                on_tech_path_now = _is_on_tech_path(
+                    support_mode,
+                    incoming_message,
+                    button_reply_id or "",
+                    active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+                )
+                db = SessionLocal()
+                try:
+                    refinement_platform = refinement_platform_for_turn(
+                        db, thread_id, history_for_llm or []
+                    )
+                    customer_name = _name_for_thread(db, thread_id)
+                finally:
+                    db.close()
+                if on_tech_path_now and refinement_platform:
+                    refinement_check = check_platform_refinement(
+                        incoming_message, refinement_platform
+                    )
+                    if refinement_check.get("status") == "unsupported":
+                        offer = _unsupported_refinement_offer_reply(
+                            customer_name=customer_name,
+                            platform=refinement_platform,
+                            unsupported_label=refinement_check.get("label") or "",
+                            refinement_type=refinement_check.get("refinement_type") or "",
+                        )
+                        offer_text = (offer.get("message") or "").strip()
+                        await send_message(phone, offer_text)
+                        _update_bot_response(
+                            message_id,
+                            bot_response=offer_text,
+                            message_source="unsupported_refinement_confirmation,dynamic_copy",
+                            confidence_score=None,
+                        )
+                        return
+
+            if (
+                not scam_context
+                and not awaiting_handoff_confirm
+                and not awaiting_platform_confirm
+                and not awaiting_unsupported_refinement_confirm
+            ):
+                on_tech_path_now = _is_on_tech_path(
+                    support_mode,
+                    incoming_message,
+                    button_reply_id or "",
+                    active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+                )
+                pending_issue = _pending_user_issue_from_history(
+                    history_for_llm or [],
+                    incoming_message,
+                    button_reply_id or "",
+                )
+                platform_pick_this_turn = _is_platform_only_user_message(
+                    incoming_message, button_reply_id or ""
+                )
+                db = SessionLocal()
+                try:
+                    user = db.query(User).filter(User.phone_number.in_([f"+{digits}", digits])).first()
+                    senior = db.query(Senior).filter(Senior.user_id == user.id).first() if user else None
+                    stored_slug = _platform_slug_from_senior(db, senior)
+                    already_past_confirm = thread_has_platform_issue_prompt(
+                        db, thread_id, exclude_message_id=message_id
+                    )
+                finally:
+                    db.close()
+                if (
+                    on_tech_path_now
+                    and senior
+                    and senior.device_id
+                    and stored_slug
+                    and not pending_issue
+                    and not platform_pick_this_turn
+                    and not already_past_confirm
+                ):
+                    db = SessionLocal()
+                    try:
+                        customer_name = _name_for_thread(db, thread_id)
+                    finally:
+                        db.close()
+                    confirm_text = _dynamic_copy(
+                        "platform_still_using",
+                        context={
+                            "platform_label": _platform_label(stored_slug),
+                            "customer_name": customer_name,
+                        },
+                    )
+                    await send_message(phone, confirm_text)
+                    _update_bot_response(
+                        message_id,
+                        bot_response=confirm_text,
+                        message_source="platform_confirmation",
+                        confidence_score=None,
+                    )
+                    return
+
             # 2. First message on a new chatbot thread after an older thread existed (e.g. after resolved).
             fresh_chatbot_thread = False
             post_resolve_welcome_sent = False
@@ -1130,10 +1412,33 @@ async def process_incoming_message(
                 db.close()
 
             # 3. Generate response from history + tool calling
+            on_tech_path_for_phase = _is_on_tech_path(
+                support_mode,
+                incoming_message,
+                button_reply_id or "",
+                active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+            )
+            unresolved_phase = resolve_unresolved_phase(
+                on_tech_path=on_tech_path_for_phase,
+                scam_mode=bool(scam_context),
+                same_issue_as_previous=same_issue_as_previous,
+                button_reply_id=button_reply_id or "",
+                current_message=incoming_message,
+                last_bot_message_source=last_bot_message_source,
+                last_bot_response=last_bot_response,
+            )
+            logger.info(
+                "UNRESOLVED_PHASE phase=%s last_bot_source=%s phone=%s",
+                unresolved_phase,
+                (last_bot_message_source or "")[:40],
+                phone,
+            )
             turn_meta = {
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
                 "unresolved_rounds": issue_followup_depth,
+                "unresolved_phase": unresolved_phase,
+                "use_platform_only_retrieval": use_platform_only_retrieval,
                 "fresh_chatbot_thread": fresh_chatbot_thread,
                 "post_resolve_welcome_sent": post_resolve_welcome_sent,
                 "active_branch": (intent_result.get("active_branch") or "").strip().lower(),
