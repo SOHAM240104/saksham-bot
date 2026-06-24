@@ -13,9 +13,11 @@ from app.models.subscriptions import Subscription, SubscriptionPlan
 # from app.models.techsaathi import TechSaathi
 from app.models.user import User
 from wati.services.conversation import (
+    _assistant_in_troubleshooting_arc,
     _build_history_messages,
     _is_on_tech_path,
     _is_platform_only_user_message,
+    _is_unresolved_negative_only,
     _name_for_thread,
     _pending_user_issue_from_history,
     _platform_label,
@@ -31,10 +33,15 @@ from wati.services.conversation import (
     save_senior_platform_from_turn,
     thread_has_platform_issue_prompt,
     _platform_slug_from_turn,
-    _prior_still_stuck_count,
+    _senior_for_thread,
+    extract_os_context_llm,
+    resolve_issue_continuity,
 )
-from wati.services.supported_refinements import check_platform_refinement
-from wati.services.unresolved_flow import resolve_unresolved_phase
+from wati.services.supported_refinements import check_platform_refinement_from_extraction
+from wati.services.unresolved_flow import (
+    resolve_unresolved_phase,
+    should_auto_handoff_by_unresolved_depth,
+)
 from wati.services.dynamic_copy import dynamic_copy as _dynamic_copy
 from wati.settings import settings
 
@@ -138,6 +145,23 @@ def _classify_wati_turn_intent_in_thread(
         raise
     finally:
         db.close()
+
+
+
+def _extract_os_context_in_thread(
+    incoming_message: str,
+    history_for_llm: list[dict] | None,
+    stored_platform: str,
+    button_reply_id: str | None,
+) -> dict:
+    return asyncio.run(
+        extract_os_context_llm(
+            incoming_message,
+            history_for_llm,
+            stored_platform=stored_platform or "",
+            button_reply_id=button_reply_id or "",
+        )
+    )
 
 
 def _generate_wati_reply_in_thread(
@@ -612,6 +636,8 @@ async def process_incoming_message(
         payload = payload or {}
         incoming_message = message
         button_reply_id = _extract_button_reply_id(payload) #Quick-reply buttons arrive as structured payload, not plain text.
+        if not button_reply_id and _is_unresolved_negative_only(incoming_message, ""):
+            button_reply_id = "not_resolved"
 
         override = None
 
@@ -741,6 +767,7 @@ async def process_incoming_message(
         await send_typing_indicator(phone)
         try:
             intent_result: dict = {}
+            os_extraction: dict = {}
             should_run_classifier = (
                 (bool(incoming_message.strip()) or bool(button_reply_id))
                 and not on_techsaathi_thread  # no intent LLM while on human thread
@@ -758,20 +785,11 @@ async def process_incoming_message(
                 # Intent result is a dictionary with the intent, active_branch, same_issue_as_previous, is_unresolved_followup, issue_followup_depth.
 
                 classified_intent = (intent_result.get("intent") or "").strip().upper()
-                same_issue_as_previous = bool(intent_result.get("same_issue_as_previous"))
-                is_unresolved_followup = bool(intent_result.get("is_unresolved_followup"))
-                raw_depth = intent_result.get("issue_followup_depth")
-                issue_followup_depth = raw_depth if isinstance(raw_depth, int) else 1
-                if issue_followup_depth < 1:
-                    issue_followup_depth = 1
                 logger.info(
-                    "LLM_INTENT intent=%s active_branch=%s phone=%s same_issue=%s unresolved_followup=%s depth=%s",
+                    "LLM_INTENT intent=%s active_branch=%s phone=%s",
                     classified_intent,
                     intent_result.get("active_branch"),
                     phone,
-                    same_issue_as_previous,
-                    is_unresolved_followup,
-                    issue_followup_depth,
                 )
 
             support_mode, scam_context = resolve_scam_context_from_turn(
@@ -799,13 +817,39 @@ async def process_incoming_message(
                 (incoming_message or "")[:80],
             )
 
-            # Deterministic signal for unresolved button taps.
-            # Button input is an explicit unresolved follow-up on current issue.
-            if button_reply_id == "not_resolved":
-                is_unresolved_followup = True
-                same_issue_as_previous = True
-                prior_still_stuck = _prior_still_stuck_count(history_for_llm or [])
-                issue_followup_depth = max(issue_followup_depth, prior_still_stuck + 2)
+            if scam_context:
+                same_issue_as_previous = False
+                issue_followup_depth = 1
+                is_unresolved_followup = False
+            elif _is_on_tech_path(
+                support_mode,
+                incoming_message,
+                button_reply_id or "",
+                active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+            ):
+                continuity = resolve_issue_continuity(
+                    history=history_for_llm or [],
+                    current_message=incoming_message,
+                    button_reply_id=button_reply_id or "",
+                    on_tech_path=True,
+                )
+                same_issue_as_previous = bool(continuity.get("same_issue_as_previous"))
+                issue_followup_depth = int(continuity.get("issue_followup_depth") or 1)
+                is_unresolved_followup = bool(continuity.get("is_unresolved_followup"))
+                if issue_followup_depth < 1:
+                    issue_followup_depth = 1
+                logger.info(
+                    "ISSUE_CONTINUITY phone=%s same_issue=%s depth=%s sig=%s unresolved=%s",
+                    phone,
+                    same_issue_as_previous,
+                    issue_followup_depth,
+                    continuity.get("issue_signature"),
+                    is_unresolved_followup,
+                )
+            else:
+                same_issue_as_previous = False
+                issue_followup_depth = 1
+                is_unresolved_followup = False
             db = SessionLocal()
             #Load previous message in thread; if last bot message was handoff confirmation → awaiting_handoff_confirm = True.
             try:
@@ -860,6 +904,29 @@ async def process_incoming_message(
             if scam_context:
                 is_unresolved = False
                 issue_followup_depth = 1
+
+            on_tech_path_for_phase = _is_on_tech_path(
+                support_mode,
+                incoming_message,
+                button_reply_id or "",
+                active_branch=(intent_result.get("active_branch") or "").strip().lower(),
+            )
+            unresolved_phase = resolve_unresolved_phase(
+                on_tech_path=on_tech_path_for_phase,
+                scam_mode=bool(scam_context),
+                same_issue_as_previous=same_issue_as_previous,
+                button_reply_id=button_reply_id or "",
+                current_message=incoming_message,
+                last_bot_message_source=last_bot_message_source,
+                last_bot_response=last_bot_response,
+            )
+            logger.info(
+                "UNRESOLVED_PHASE phase=%s last_bot_source=%s phone=%s depth=%s",
+                unresolved_phase,
+                (last_bot_message_source or "")[:40],
+                phone,
+                issue_followup_depth,
+            )
 
             if classified_intent == "RESOLVED":
                 # On scam path, only the main LLM closes via conversation_control (RULE 0).
@@ -974,11 +1041,15 @@ async def process_incoming_message(
                         and not switched_from_human_to_chatbot_this_turn
                     ):
                         ask_handoff_confirmation = True
-                    elif (
-                        not scam_context
-                        and same_issue_as_previous
-                        and is_unresolved
-                        and issue_followup_depth >= 3
+                    elif should_auto_handoff_by_unresolved_depth(
+                        scam_mode=bool(scam_context),
+                        on_tech_path=on_tech_path_for_phase,
+                        same_issue_as_previous=same_issue_as_previous,
+                        button_reply_id=button_reply_id or "",
+                        current_message=incoming_message,
+                        issue_followup_depth=issue_followup_depth,
+                        unresolved_phase=unresolved_phase,
+                        last_bot_message_source=last_bot_message_source,
                     ):
                         hid = resolve_assigned_chatbot_thread_and_create_techsaathi_thread(
                             db, thread_id
@@ -1251,11 +1322,28 @@ async def process_incoming_message(
                         db, thread_id, history_for_llm or []
                     )
                     customer_name = _name_for_thread(db, thread_id)
+                    senior_row = _senior_for_thread(db, thread_id)
+                    stored_platform = _platform_slug_from_senior(db, senior_row) or ""
                 finally:
                     db.close()
+                os_extraction = {}
+                if (
+                    on_tech_path_now
+                    and refinement_platform
+                    and refinement_platform != "samsung"
+                ):
+                    os_extraction = await asyncio.to_thread(
+                        _extract_os_context_in_thread,
+                        incoming_message,
+                        history_for_llm,
+                        stored_platform,
+                        button_reply_id,
+                    )
                 if on_tech_path_now and refinement_platform:
-                    refinement_check = check_platform_refinement(
-                        incoming_message, refinement_platform
+                    refinement_check = check_platform_refinement_from_extraction(
+                        os_extraction,
+                        refinement_platform,
+                        text=incoming_message,
                     )
                     if refinement_check.get("status") == "unsupported":
                         offer = _unsupported_refinement_offer_reply(
@@ -1363,6 +1451,13 @@ async def process_incoming_message(
                     and not prior_msg_in_same_thread
                     and prior_thread_exists
                 )
+                if (
+                    is_unresolved
+                    or _assistant_in_troubleshooting_arc(
+                        last_bot_message_source, last_bot_response
+                    )
+                ):
+                    fresh_chatbot_thread = False
                 if fresh_chatbot_thread:
                     prev_thread = (
                         db.query(Thread)
@@ -1412,27 +1507,6 @@ async def process_incoming_message(
                 db.close()
 
             # 3. Generate response from history + tool calling
-            on_tech_path_for_phase = _is_on_tech_path(
-                support_mode,
-                incoming_message,
-                button_reply_id or "",
-                active_branch=(intent_result.get("active_branch") or "").strip().lower(),
-            )
-            unresolved_phase = resolve_unresolved_phase(
-                on_tech_path=on_tech_path_for_phase,
-                scam_mode=bool(scam_context),
-                same_issue_as_previous=same_issue_as_previous,
-                button_reply_id=button_reply_id or "",
-                current_message=incoming_message,
-                last_bot_message_source=last_bot_message_source,
-                last_bot_response=last_bot_response,
-            )
-            logger.info(
-                "UNRESOLVED_PHASE phase=%s last_bot_source=%s phone=%s",
-                unresolved_phase,
-                (last_bot_message_source or "")[:40],
-                phone,
-            )
             turn_meta = {
                 "button_reply_id": button_reply_id or "",
                 "unresolved_signal_current_turn": is_unresolved,
@@ -1441,8 +1515,12 @@ async def process_incoming_message(
                 "use_platform_only_retrieval": use_platform_only_retrieval,
                 "fresh_chatbot_thread": fresh_chatbot_thread,
                 "post_resolve_welcome_sent": post_resolve_welcome_sent,
+                "active_tech_troubleshooting_arc": _assistant_in_troubleshooting_arc(
+                    last_bot_message_source, last_bot_response
+                ),
                 "active_branch": (intent_result.get("active_branch") or "").strip().lower(),
                 "classifier_intent": (intent_result.get("intent") or "").strip().upper(),
+                "os_extraction": os_extraction,
             }
             llm_result = override or await asyncio.to_thread(
                 _generate_wati_reply_in_thread,

@@ -54,6 +54,10 @@ def _last_bot_was_diagnostic(
     return bool(last_bot_response and _looks_like_unresolved_diagnostic(last_bot_response))
 
 
+def _last_bot_was_refined_unresolved_steps(last_bot_message_source: str) -> bool:
+    return "refined_unresolved" in (last_bot_message_source or "").lower()
+
+
 def resolve_unresolved_phase(
     *,
     on_tech_path: bool,
@@ -76,6 +80,9 @@ def resolve_unresolved_phase(
     last_text = (last_bot_response or "").strip()
 
     if _is_unresolved_negative_only(current_message, button_reply_id):
+        if _last_bot_was_refined_unresolved_steps(last_source):
+            # Cycle 3 complete — handoff is handled in code; do not re-ask diagnostic.
+            return UNRESOLVED_PHASE_NONE
         if _last_bot_was_troubleshooting_steps(last_source, last_text):
             return UNRESOLVED_PHASE_DIAGNOSTIC
         return UNRESOLVED_PHASE_NONE
@@ -86,6 +93,42 @@ def resolve_unresolved_phase(
     return UNRESOLVED_PHASE_NONE
 
 
+def should_auto_handoff_by_unresolved_depth(
+    *,
+    scam_mode: bool,
+    on_tech_path: bool,
+    same_issue_as_previous: bool,
+    button_reply_id: str,
+    current_message: str,
+    issue_followup_depth: int,
+    unresolved_phase: str,
+    last_bot_message_source: str = "",
+) -> bool:
+    """
+    Auto-escalate only on explicit Still Stuck (button or short negative phrase)
+    after cycle 3, not on substantive diagnostic refinement replies.
+    """
+    from wati.services.conversation import _is_unresolved_negative_only
+
+    if scam_mode or not on_tech_path or not same_issue_as_previous:
+        return False
+
+    is_still_stuck = (button_reply_id or "").strip().lower() == "not_resolved" or (
+        _is_unresolved_negative_only(current_message, button_reply_id)
+    )
+    if is_still_stuck and _last_bot_was_refined_unresolved_steps(last_bot_message_source):
+        return True
+
+    if issue_followup_depth < 3:
+        return False
+    phase = (unresolved_phase or UNRESOLVED_PHASE_NONE).strip().lower()
+    if phase == UNRESOLVED_PHASE_REFINED_RETRY:
+        return False
+    if (button_reply_id or "").strip().lower() == "not_resolved":
+        return True
+    return _is_unresolved_negative_only(current_message, button_reply_id)
+
+
 def retrieve_for_refined_unresolved_turn(
     *,
     history: list[dict],
@@ -93,6 +136,8 @@ def retrieve_for_refined_unresolved_turn(
     pending_user_issue: str,
     platform: str,
     use_platform_only_retrieval: bool = False,
+    known_os_version: str = "",
+    known_model: str = "",
 ) -> dict:
     """
     Run deterministic RAG retrieval for refined Still Stuck retry.
@@ -117,14 +162,14 @@ def retrieve_for_refined_unresolved_turn(
         }
 
     chat_ctx = _infer_runtime_context(history)
-    known_os_version = (chat_ctx.get("known_os_version") or "").strip().lower()
-    known_model = (chat_ctx.get("known_model") or "").strip().lower()
+    os_version = (known_os_version or chat_ctx.get("known_os_version") or "").strip().lower()
+    model = (known_model or chat_ctx.get("known_model") or "").strip().lower()
     if use_platform_only_retrieval:
-        known_os_version = ""
-        known_model = ""
+        os_version = ""
+        model = ""
 
     retrieval_os, retrieval_version = _map_retrieval_os_and_version(
-        platform_slug, known_os_version, known_model
+        platform_slug, os_version, model
     )
     base_query = (pending_user_issue or current_message or "").strip()
     prior_steps = _last_assistant_troubleshooting_from_history(history)
@@ -141,7 +186,7 @@ def retrieve_for_refined_unresolved_turn(
     if retrieval_version:
         hint_lines.append(f"os_version: {retrieval_version}")
     if known_model and platform_slug == "samsung":
-        hint_lines.append(f"device_model: {known_model}")
+        hint_lines.append(f"device_model: {model}")
     if (current_message or "").strip() and current_message.strip() != pending_user_issue:
         hint_lines.append(f"user_refinement: {(current_message or '').strip()}")
     if hint_lines:

@@ -68,7 +68,7 @@ SUPPORTED_SAMSUNG_MODELS = frozenset(
 )
 
 
-def _normalize_samsung_model(text: str) -> str:
+def _normalize_samsung_model_regex(text: str) -> str:
     lowered = re.sub(r"\s+", " ", (text or "").lower()).strip()
     if not lowered:
         return ""
@@ -121,8 +121,7 @@ def _normalize_samsung_model(text: str) -> str:
     return ""
 
 
-def _extract_apple_version(text: str) -> tuple[str, str]:
-    """Return (family, version) e.g. ('ios', '26') or ('', '')."""
+def _regex_extract_apple_version(text: str) -> tuple[str, str]:
     lowered = (text or "").lower()
     m = re.search(r"\bipados\s*(\d+(?:\.\d+)?)\b", lowered)
     if m:
@@ -133,7 +132,7 @@ def _extract_apple_version(text: str) -> tuple[str, str]:
     return "", ""
 
 
-def _extract_coloros_version(text: str) -> str:
+def _regex_extract_coloros_version(text: str) -> str:
     m = re.search(r"\bcolor\s*os\s*(\d+(?:\.\d+)?)\b", (text or "").lower())
     if m:
         return m.group(1)
@@ -143,7 +142,7 @@ def _extract_coloros_version(text: str) -> str:
     return ""
 
 
-def _extract_hyperos_version(text: str) -> str:
+def _regex_extract_hyperos_version(text: str) -> str:
     m = re.search(r"\bhyper\s*os\s*(\d+(?:\.\d+)?)\b", (text or "").lower())
     if m:
         return m.group(1).split(".")[0]
@@ -153,30 +152,33 @@ def _extract_hyperos_version(text: str) -> str:
     return ""
 
 
-def _extract_android_version(text: str) -> str:
+def _regex_extract_android_version(text: str) -> str:
     m = re.search(r"\bandroid\s*(\d+(?:\.\d+)?)\b", (text or "").lower())
     if m:
         return m.group(1).split(".")[0]
     return ""
 
 
-def check_platform_refinement(text: str, platform: str) -> dict:
-    """
-    Validate explicit OS/model refinement in user text for a known platform.
-
-    Returns dict with keys:
-      status: none | supported | unsupported
-      label: human-readable unsupported label (when unsupported)
-      refinement_type: version | model
-    """
+def validate_platform_refinement(
+    platform: str,
+    *,
+    os_family: str = "",
+    os_version: str = "",
+    device_model: str = "",
+) -> dict:
     p = (platform or "").strip().lower()
     if p not in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
         return {"status": "none", "label": "", "refinement_type": ""}
 
+    family = (os_family or "").strip().lower()
+    version = (os_version or "").strip()
+    model = (device_model or "").strip().lower()
+
     if p == "apple":
-        family, version = _extract_apple_version(text)
         if not version:
             return {"status": "none", "label": "", "refinement_type": ""}
+        if family not in {"ios", "ipados"}:
+            family = "ipados" if "ipad" in family else "ios"
         allowed = SUPPORTED_APPLE_IPADOS if family == "ipados" else SUPPORTED_APPLE_IOS
         display = f"iPadOS {version}" if family == "ipados" else f"iOS {version}"
         if version in allowed:
@@ -184,7 +186,6 @@ def check_platform_refinement(text: str, platform: str) -> dict:
         return {"status": "unsupported", "label": display, "refinement_type": "version"}
 
     if p == "samsung":
-        model = _normalize_samsung_model(text)
         if not model:
             return {"status": "none", "label": "", "refinement_type": ""}
         display = model.replace("_", " ").upper()
@@ -195,7 +196,6 @@ def check_platform_refinement(text: str, platform: str) -> dict:
         return {"status": "unsupported", "label": display, "refinement_type": "model"}
 
     if p == "oppo":
-        version = _extract_coloros_version(text)
         if not version:
             return {"status": "none", "label": "", "refinement_type": ""}
         display = f"ColorOS {version}"
@@ -204,7 +204,6 @@ def check_platform_refinement(text: str, platform: str) -> dict:
         return {"status": "unsupported", "label": display, "refinement_type": "version"}
 
     if p == "xiaomi":
-        version = _extract_hyperos_version(text)
         if not version:
             return {"status": "none", "label": "", "refinement_type": ""}
         display = f"HyperOS {version}"
@@ -213,12 +212,75 @@ def check_platform_refinement(text: str, platform: str) -> dict:
         return {"status": "unsupported", "label": display, "refinement_type": "version"}
 
     if p == "pixel":
-        version = _extract_android_version(text)
         if not version:
             return {"status": "none", "label": "", "refinement_type": ""}
         display = f"Android {version}"
         if version in SUPPORTED_PIXEL_ANDROID:
             return {"status": "supported", "label": display, "refinement_type": "version"}
         return {"status": "unsupported", "label": display, "refinement_type": "version"}
+
+    return {"status": "none", "label": "", "refinement_type": ""}
+
+
+def check_platform_refinement_from_extraction(
+    extraction: dict | None,
+    platform: str,
+    *,
+    text: str = "",
+) -> dict:
+    """LLM for OS version; regex for Samsung device model."""
+    p = (platform or "").strip().lower()
+    if p == "samsung":
+        return check_platform_refinement(text, platform)
+
+    ext = extraction or {}
+    confidence = str(ext.get("confidence") or "").strip().lower()
+    os_family = str(ext.get("os_family") or "").strip().lower()
+    os_version = str(ext.get("os_version") or "").strip()
+
+    if os_version and confidence != "low":
+        return validate_platform_refinement(
+            platform,
+            os_family=os_family,
+            os_version=os_version,
+            device_model="",
+        )
+    return check_platform_refinement(text, platform)
+
+
+def check_platform_refinement(text: str, platform: str) -> dict:
+    p = (platform or "").strip().lower()
+    if p not in {"apple", "samsung", "pixel", "oppo", "xiaomi"}:
+        return {"status": "none", "label": "", "refinement_type": ""}
+
+    if p == "apple":
+        family, version = _regex_extract_apple_version(text)
+        return validate_platform_refinement(
+            p, os_family=family, os_version=version, device_model=""
+        )
+
+    if p == "samsung":
+        model = _normalize_samsung_model_regex(text)
+        return validate_platform_refinement(
+            p, os_family="", os_version="", device_model=model
+        )
+
+    if p == "oppo":
+        version = _regex_extract_coloros_version(text)
+        return validate_platform_refinement(
+            p, os_family="coloros", os_version=version, device_model=""
+        )
+
+    if p == "xiaomi":
+        version = _regex_extract_hyperos_version(text)
+        return validate_platform_refinement(
+            p, os_family="hyperos", os_version=version, device_model=""
+        )
+
+    if p == "pixel":
+        version = _regex_extract_android_version(text)
+        return validate_platform_refinement(
+            p, os_family="android", os_version=version, device_model=""
+        )
 
     return {"status": "none", "label": "", "refinement_type": ""}
