@@ -75,25 +75,13 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
             "whether they use iPhone/iPad or Android so guidance can match their phone. "
             "Plain text only; do not ask what happened yet."
         ),
-        "scam_resolve_ask": "Ask only: Does this resolve ur query?",
-        "scam_prevention_offer": "Ask only: Do u need to know how to prevent it?",
-        "scam_loss_check": (
-            "Ask only whether they sent money or shared OTP, password, or banking details."
-        ),
-        "scam_safe_praise": (
-            "One warm sentence praising the user for not sharing money or OTPs with the scammer."
-        ),
-        "scam_close": (
-            "One warm sentence closing scam help — glad they reached out, here if they need anything later."
-        ),
         "platform_still_using": (
             "Ask if the user is still using their phone described by platform_label in context; "
             "mention platform_label naturally; end with a clear Yes or No question."
         ),
         "platform_issue_ask": (
             "User confirmed they are still on the same phone (platform_label in context). "
-            "Ask one warm open question — e.g. how you can assist them with their platform_label phone today. "
-            "Use positive, helpful wording; avoid the word 'issue'."
+            "Ask one warm open question about what issue or problem they need help with on that phone."
         ),
         "unresolved_diagnostic": (
             "User says previous troubleshooting steps did not work (Still Stuck). "
@@ -134,22 +122,11 @@ def dynamic_copy(kind: str, context: dict | None = None) -> str:
         "scam_os_prompt": (
             "To guide you better, is your phone an iPhone/iPad or Android?"
         ),
-        "scam_resolve_ask": "Does this resolve ur query?",
-        "scam_prevention_offer": "Do u need to know how to prevent it?",
-        "scam_loss_check": (
-            "Did u send any money, or share any OTP, password, or banking details with anyone?"
-        ),
-        "scam_safe_praise": (
-            "That's a good call — u did the right thing by not sharing anything."
-        ),
-        "scam_close": (
-            "Happy to help, and please reach out anytime if you need support."
-        ),
         "platform_still_using": (
             "Are you still using the same phone? Please reply Yes or No."
         ),
         "platform_issue_ask": (
-            "How can I assist you with your phone today?"
+            "What issue are you having with your phone today?"
         ),
         "unresolved_diagnostic": (
             "What step didn't work, or what did you see instead when you tried those steps?"
