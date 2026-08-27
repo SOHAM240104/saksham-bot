@@ -1,0 +1,22 @@
+# Chat / agent API only — no crawl4ai, docling, pandas, boto3 (ingestion).
+# Use with: SAKSHAM_ENABLE_INGESTION=0
+#
+#   pip install -r requirements-api-demo.txt
+#   SAKSHAM_ENABLE_INGESTION=0 uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+fastapi==0.115.8
+starlette>=0.40.0,<0.46.0
+uvicorn==0.34.0
+python-multipart==0.0.20
+
+psycopg[binary]==3.3.3
+sqlalchemy==2.0.49
+pydantic
+python-dotenv==1.0.1
+PyJWT>=2.8.0
+
+langchain==1.1.0
+langchain-core==1.1.0
+langchain-openai==1.1.0
+langchain-postgres==0.0.17
+openai==2.31.0

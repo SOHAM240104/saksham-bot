@@ -1,8 +1,8 @@
 import logging
+import os
 
 from fastapi import FastAPI
 
-from app.routers.admin import router as flow_router
 from app.routers.agent import router as agent_router
 from app.routers.chat import router as chat_router
 from app.routers.health import router as health_router
@@ -14,9 +14,20 @@ logging.basicConfig(
 
 app = FastAPI(title="Saksham Bot API", version="1.0.0")
 app.include_router(health_router)
-app.include_router(flow_router)
 app.include_router(chat_router)
 app.include_router(agent_router)
+
+# Ingestion/admin pulls crawl4ai + docling — off for slim demo deploys.
+_enable_ingestion = os.getenv("SAKSHAM_ENABLE_INGESTION", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+if _enable_ingestion:
+    from app.routers.admin import router as flow_router
+
+    app.include_router(flow_router)
 
 
 @app.get("/")
