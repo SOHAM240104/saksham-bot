@@ -1,0 +1,7 @@
+# Streamlit Cloud only — do NOT use root requirements.txt (too heavy).
+streamlit>=1.28.0
+requests>=2.31.0
+python-dotenv==1.0.1
+PyJWT>=2.8.0
+SQLAlchemy==2.0.49
+psycopg[binary]==3.3.3

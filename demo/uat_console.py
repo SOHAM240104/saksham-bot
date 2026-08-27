@@ -22,6 +22,17 @@ from demo.api_client import SakshamClient, SSEEvent  # noqa: E402
 
 st.set_page_config(page_title="Saksham UAT Console", page_icon="💬", layout="wide")
 
+
+def _secret_or_env(key: str, default: str = "") -> str:
+    """Streamlit Cloud secrets first, then env (local .env / shell)."""
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return (os.getenv(key, default) or "").strip() or default
+
+
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 
 st.markdown(
@@ -49,7 +60,7 @@ st.markdown(
 # ── Session state defaults ───────────────────────────────────────────────────
 
 _DEFAULTS: dict = {
-    "api_base": os.getenv("SAKSHAM_API_BASE", "http://127.0.0.1:8000"),
+    "api_base": _secret_or_env("SAKSHAM_API_BASE", "http://127.0.0.1:8000"),
     "senior_jwt": "",
     "agent_jwt": "",
     "chat_history": [],        # list[dict] — {role, text, ui?}
@@ -76,6 +87,18 @@ def _mint_jwt(role: str, phone_suffix: str) -> str:
     """Call scripts/mint_test_jwt.py and return the raw token string."""
     script = os.path.join(ROOT, "scripts", "mint_test_jwt.py")
     env = {**os.environ}
+    for key in (
+        "JWT_SECRET_KEY",
+        "DATABASE_URL",
+        "DATABASE_USER",
+        "DATABASE_PASSWORD",
+        "DATABASE_HOST",
+        "DATABASE_PORT",
+        "DATABASE_NAME",
+    ):
+        val = _secret_or_env(key)
+        if val:
+            env[key] = val
     env.setdefault("JWT_SECRET_KEY", "local-dev-jwt-secret-saksham-bot")
     try:
         result = subprocess.run(
@@ -223,6 +246,12 @@ with st.sidebar:
 
     st.subheader("API")
     st.session_state.api_base = st.text_input("Base URL", value=st.session_state.api_base)
+    _base = (st.session_state.api_base or "").strip()
+    if not _base or "127.0.0.1" in _base or "localhost" in _base:
+        st.warning(
+            "This app needs a **public** API URL. "
+            "localhost only works on your laptop — not on Streamlit Cloud."
+        )
 
     st.divider()
     st.subheader("Senior Login")
