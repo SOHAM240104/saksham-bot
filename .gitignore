@@ -20,3 +20,11 @@ env/
 
 # Internal AI / agent docs (not shipped)
 ai/
+
+# Demo / local run artifacts
+demo/*.log
+demo/__pycache__/
+demo/run_*_test.py
+demo/run_product_uat.py
+tests/
+.pytest_cache/

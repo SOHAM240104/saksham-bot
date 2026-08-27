@@ -13,6 +13,7 @@ def get_env(name: str) -> str:
 
 
 ADMIN_TOKEN = get_env("ADMIN_TOKEN")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION_NAME = os.getenv("AWS_REGION_NAME")
@@ -24,6 +25,9 @@ EMBEDDING_DIMENSIONS = 1024
 # PGVector: two separate collections — tech (full context metadata) vs scam (minimal metadata).
 TECH_VECTOR_COLLECTION = "tech"
 SCAM_VECTOR_COLLECTION = "scam_kb"
+
+# Optional scam-support bank helpline deep link (empty = omit from prompts).
+BANK_HELPLINE_URL = os.getenv("BANK_HELPLINE_URL", "").strip()
 
 # Valid collection names for get_vector_store (tech train uses only tech; scam pipeline uses SCAM_VECTOR_COLLECTION).
 ALLOWED_PGVECTOR_COLLECTIONS = frozenset({TECH_VECTOR_COLLECTION, SCAM_VECTOR_COLLECTION})

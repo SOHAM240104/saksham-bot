@@ -159,6 +159,63 @@ def _regex_extract_android_version(text: str) -> str:
     return ""
 
 
+_EXPLICIT_APPLE_OS_RE = re.compile(
+    r"\b(?:ios|ipados)\s*(?:version\s*)?(\d+(?:\.\d+)?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def user_texts_for_os_guard(
+    current_message: str,
+    history: list[dict] | None = None,
+) -> list[str]:
+    texts: list[str] = []
+    for item in history or []:
+        if (item.get("role") or "") != "user":
+            continue
+        content = (item.get("content") or "").strip()
+        if content:
+            texts.append(content)
+    current = (current_message or "").strip()
+    if current and (not texts or texts[-1] != current):
+        texts.append(current)
+    return texts
+
+
+def has_explicit_apple_os_claim(texts: list[str], version: str = "") -> bool:
+    """True only when user named iOS/iPadOS (not an iPhone/iPad hardware model)."""
+    want = (version or "").strip().split(".")[0]
+    for text in texts:
+        for match in _EXPLICIT_APPLE_OS_RE.finditer(text or ""):
+            found = (match.group(1) or "").split(".")[0]
+            if not want or found == want:
+                return True
+    return False
+
+
+def sanitize_os_extraction(
+    extraction: dict | None,
+    *,
+    current_message: str,
+    history: list[dict] | None = None,
+) -> dict:
+    """Drop false OS versions inferred from iPhone/iPad device model numbers.
+
+    Example: "my iPhone 16" must not become unsupported iOS 16.
+    """
+    out = dict(extraction or {})
+    family = str(out.get("os_family") or "").strip().lower()
+    version = str(out.get("os_version") or "").strip()
+    if family not in {"ios", "ipados"} or not version:
+        return out
+
+    texts = user_texts_for_os_guard(current_message, history)
+    if has_explicit_apple_os_claim(texts, version):
+        return out
+
+    return {"os_family": "", "os_version": "", "confidence": "low"}
+
+
 def validate_platform_refinement(
     platform: str,
     *,

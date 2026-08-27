@@ -13,22 +13,25 @@ from app.models.chat.chat import Conversation, Message, Thread
 from app.models.chatbot.context import PlatformModel
 from app.models.senior import Senior
 from app.models.user import User
-from wati.llm.rag_chain import search_scam_kb, search_support_docs
-from wati.services.dynamic_copy import dynamic_copy
-from wati.services.supported_refinements import check_platform_refinement_from_extraction
-from wati.services.unresolved_flow import (
+from app.services.chat.copy import dynamic_copy
+from app.services.chat.platform_refinement import (
+    check_platform_refinement_from_extraction,
+    sanitize_os_extraction,
+)
+from app.services.chat.rag import search_scam_kb, search_support_docs
+from app.services.chat.still_stuck import (
     UNRESOLVED_PHASE_DIAGNOSTIC,
     UNRESOLVED_PHASE_REFINED_RETRY,
     retrieve_for_refined_unresolved_turn,
 )
-from wati.settings import settings
+from app.settings import BANK_HELPLINE_URL
 
-logger = logging.getLogger("wati.services.conversation")
+logger = logging.getLogger("app.services.chat.reply")
 MODEL_NAME = "gpt-4.1-mini"
 CLASSIFIER_MODEL_NAME = "gpt-4o-mini"
 MAX_OUTPUT_TOKENS = 1000
 SUPPORTED_PLATFORMS = ("apple", "samsung", "pixel", "oppo", "xiaomi")
-# WhatsApp list row titles — whole message must match (case-insensitive) after platform pick.
+# Platform picker row titles — whole message must match (case-insensitive) after platform pick.
 PLATFORM_LIST_SELECTION_TOKENS = frozenset(SUPPORTED_PLATFORMS)
 _PLATFORM_LIST_TEXT_ALIASES = frozenset(
     {
@@ -59,7 +62,7 @@ def _is_platform_only_user_message(text: str, button_reply_id: str = "") -> bool
         return False
     if _PLATFORM_ISSUE_HINTS.search(t):
         return False
-    # WhatsApp list rows are short brand labels (e.g. "Apple iPhone / iPad").
+    # Platform picker rows are short brand labels (e.g. "Apple iPhone / iPad").
     return len(t.split()) <= 6
 
 
@@ -76,7 +79,7 @@ _SCAM_KB_TOOL_PREFIX = (
 
 _SUPPORT_KB_TOOL_PREFIX = (
     "The excerpts below are REFERENCE ONLY for facts and UI labels — never paste them verbatim.\n"
-    "Rewrite every step in conversational WhatsApp voice, as if you are on the phone guiding "
+    "Rewrite every step in warm conversational voice, as if you are on the phone guiding "
     "the user side by side:\n"
     "- Second person, warm imperatives (Open…, Tap…, Now you should see…)\n"
     "- One numbered step per main action; use then / and then inside a line where natural\n"
@@ -96,7 +99,7 @@ def send_mode_buttons(message: str):
 
 @tool("send_platform_buttons")
 def send_platform_buttons(message: str):
-    """Return intent to show a WhatsApp list picker for phone brand with dynamic LLM message."""
+    """Return intent to show a platform picker for phone brand with dynamic LLM message."""
     return {"action": "platform_buttons", "message": (message or "").strip()}
 
 
@@ -137,10 +140,10 @@ MAIN_LLM = ChatOpenAI(
 
 
 def _load_system_prompt() -> str:
-    system_prompt_path = Path(__file__).resolve().parents[1] / "llm" / "systemprompt.txt"
+    system_prompt_path = Path(__file__).resolve().parent / "systemprompt.txt"
     if system_prompt_path.exists():
         return system_prompt_path.read_text(encoding="utf-8").strip()
-    return "You are a smartphone support assistant for WhatsApp."
+    return "You are a smartphone support assistant for Saksham website chat."
 
 
 def _build_history_messages(db, thread_id: int, current_message_id: int, current_user_message: str):
@@ -216,7 +219,7 @@ def _extract_json_object(raw: str) -> dict:
         return {}
 
 
-async def classify_wati_turn_intent(
+async def classify_turn_intent(
     db,
     thread_id: int,
     current_message_id: int,
@@ -245,8 +248,17 @@ async def classify_wati_turn_intent(
         "is_unresolved_followup=true ONLY for tech troubleshooting (still stuck / not working on phone issue) — always false when active_branch is scam.\n"
         "Treat short unresolved-negative continuations like 'still stuck', 'not resolved', 'same issue', 'not working', 'didn't work' (tech phone issues only) as is_unresolved_followup=true.\n"
         "intent must be one of: REQUEST_HUMAN, RESOLVED, OTHER.\n"
-        "intent RESOLVED only when the user clearly ends the CURRENT help arc (thanks, all done, sorted, bye) — NOT for scam mid-flow replies like bank name, 'no I didn't', 'done' after 1930 offer, 'yes' to prevention tips, or 'what now'.\n"
-        "When active_branch is scam and scam help is still in progress → intent must be OTHER (never RESOLVED).\n"
+        "intent RESOLVED is a soft suggestion only (code decides close). Judge meaning, not keywords.\n"
+        "Use RESOLVED when the user is ending the CURRENT help arc: issue fixed/sorted, "
+        "OR a clear farewell / conversation close (leaving, goodbye, done for now, that's all, "
+        "signing off for the night, talk later) — including after troubleshooting steps when they "
+        "are signing off rather than waiting for more steps. Judge meaning, not a fixed phrase list.\n"
+        "Use OTHER for soft mid-troubleshooting acknowledgments that keep the arc open "
+        "(brief ok/okay/haan/sure/got it without saying it worked or that they are leaving).\n"
+        "NOT RESOLVED for scam mid-flow replies like bank name, 'no I didn't', 'done' after 1930 offer, "
+        "'yes' to prevention tips, or 'what now'.\n"
+        "On scam path: RESOLVED is allowed only after scam help is finished (complaint/prevention offered or user clearly closing); "
+        "while scam help is still in progress → intent must be OTHER.\n"
         "When user asks for human/agent → intent REQUEST_HUMAN.\n"
         "Same-issue depth and Still Stuck counting are handled in code — do not output them.\n"
         "No prose, no markdown.\n"
@@ -279,8 +291,6 @@ async def classify_wati_turn_intent(
     active_branch = str(parsed.get("active_branch") or "").strip().lower()
     if active_branch not in {"scam", "tech", "ambiguous"}:
         active_branch = "ambiguous"
-    if active_branch == "scam" and intent == "RESOLVED":
-        intent = "OTHER"
     return {
         "intent": intent,
         "active_branch": active_branch,
@@ -302,6 +312,10 @@ _OS_EXTRACTION_SYSTEM = (
     "- iPad / iPadOS → os_family=ipados.\n"
     "- Android version → os_family=android.\n"
     "- ColorOS / HyperOS → set os_family and os_version.\n"
+    "- CRITICAL: 'iPhone 16', 'iPhone 15 Pro', 'iPad Pro 13', 'my iPhone 14' are DEVICE MODELS, "
+    "not OS versions. Never set os_version from an iPhone/iPad model number. "
+    "Only set ios/ipados os_version when the user said iOS/iPadOS (e.g. 'iOS 18', 'iPadOS 17', "
+    "'Settings > General > About shows 18.1').\n"
     "- Use confidence=high only when user clearly stated the OS version; else low.\n"
     "- stored_platform hint is the saved device brand — use only to disambiguate OS family, not model.\n"
     "No prose, no markdown.\n"
@@ -388,6 +402,18 @@ async def extract_os_context_llm(
         parsed = {}
 
     normalized = _normalize_os_extraction(parsed)
+    before = dict(normalized)
+    normalized = sanitize_os_extraction(
+        normalized,
+        current_message=current_message,
+        history=history_window,
+    )
+    if before != normalized:
+        logger.info(
+            "OS_EXTRACTION_SANITIZE dropped %s %s (no explicit iOS/iPadOS claim)",
+            before.get("os_family") or "none",
+            before.get("os_version") or "none",
+        )
     logger.info(
         "OS_EXTRACTION os_family=%s os_version=%s confidence=%s",
         normalized.get("os_family") or "none",
@@ -537,9 +563,21 @@ def _pending_user_issue_from_history(
     current_message: str,
     button_reply_id: str = "",
 ) -> str:
-    """Last substantive user message before a branch-change reply (for tech/scam handoff)."""
+    """Last substantive user issue (tech/scam story), skipping acks and vague OS fluff."""
     btn = (button_reply_id or "").strip().lower()
-    skip_current = _is_branch_change_short_reply(current_message) or _user_switch_reply(current_message)
+    # Prefer continuity anchor when Still Stuck / diagnostic follow-up
+    if btn == "not_resolved" or is_unresolved_negative_only(current_message, btn):
+        anchor = _current_issue_anchor(history, current_message, button_reply_id)
+        if anchor:
+            return anchor[:500]
+    if _is_diagnostic_refinement_reply(history, current_message, button_reply_id):
+        anchor = _current_issue_anchor(history, current_message, button_reply_id)
+        if anchor:
+            return anchor[:500]
+
+    skip_current = _is_branch_change_short_reply(current_message) or _user_switch_reply(
+        current_message
+    )
     for item in reversed(history):
         if item.get("role") != "user":
             continue
@@ -555,6 +593,10 @@ def _pending_user_issue_from_history(
             continue
         if _user_switch_reply(content) or len(content) < 12:
             continue
+        if is_unresolved_negative_only(content, ""):
+            continue
+        if _looks_like_vague_os_or_noise(content):
+            continue
         return content[:500]
     current = (current_message or "").strip()
     if (
@@ -564,10 +606,59 @@ def _pending_user_issue_from_history(
         and not _is_platform_only_user_message(current, button_reply_id)
         and len(current) >= 12
         and not _is_scam_entry_message(current)
+        and not is_unresolved_negative_only(current, button_reply_id)
+        and not _looks_like_vague_os_or_noise(current)
     ):
         return current[:500]
     return ""
 
+
+def _looks_like_vague_os_or_noise(text: str) -> bool:
+    """True for OS/model fluff that must not become the retrieval query."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower()).rstrip(".!? ")
+    if not t:
+        return True
+    if len(t) < 40 and any(
+        p in t
+        for p in (
+            "ios",
+            "iphone",
+            "ipad",
+            "android",
+            "idk",
+            "i don't know",
+            "dont know",
+            "don't know",
+            "not sure",
+            "maybe",
+            "something",
+        )
+    ):
+        # Short "idk maybe ios something" — not the device issue itself
+        if not any(
+            p in t
+            for p in (
+                "wifi",
+                "wi-fi",
+                "bluetooth",
+                "battery",
+                "screen",
+                "hot",
+                "charge",
+                "update",
+                "app",
+                "photo",
+                "gallery",
+                "speaker",
+                "headphone",
+                "alarm",
+                "flashlight",
+                "hang",
+                "flicker",
+            )
+        ):
+            return True
+    return False
 
 def _fallback_reply_text(on_scam_path: bool) -> str:
     if on_scam_path:
@@ -849,7 +940,7 @@ def _recent_user_messages_snippet(history: list[dict], *, limit: int = 8) -> str
 
 
 def _infer_support_mode(history: list[dict]) -> str:
-    """Last explicit mode from WhatsApp quick-reply titles (tech / scam)."""
+    """Last explicit mode from mode chip labels (tech / scam)."""
     mode = ""
     for item in history:
         if item.get("role") != "user":
@@ -1005,7 +1096,7 @@ def refinement_platform_for_turn(db, thread_id: int, history: list[dict]) -> str
     return (ctx.get("known_platform") or "").strip().lower()
 
 
-def _is_unresolved_negative_only(text: str, button_reply_id: str = "") -> bool:
+def is_unresolved_negative_only(text: str, button_reply_id: str = "") -> bool:
     """True when the user only signals the previous fix did not work (Still Stuck tap or equivalent)."""
     btn = (button_reply_id or "").strip().lower()
     if btn in {"not_resolved", "still_stuck"}:
@@ -1013,6 +1104,20 @@ def _is_unresolved_negative_only(text: str, button_reply_id: str = "") -> bool:
     raw = (text or "").strip()
     t = re.sub(r"\s+", " ", raw.lower()).rstrip(".!? ")
     if not t:
+        return False
+    # "still stuck please connect me to someone" is a human ask, not Still Stuck-only
+    if any(
+        p in t
+        for p in (
+            "human",
+            "agent",
+            "tech saathi",
+            "connect me",
+            "talk to someone",
+            "speak to someone",
+            "real person",
+        )
+    ):
         return False
     short_phrases = (
         "still stuck",
@@ -1074,7 +1179,7 @@ def _is_substantive_issue_user_message(content: str, button_reply_id: str = "") 
     text = (content or "").strip()
     if not text:
         return False
-    if _is_unresolved_negative_only(text, button_reply_id):
+    if is_unresolved_negative_only(text, button_reply_id):
         return False
     if _is_branch_change_short_reply(text) or _user_switch_reply(text):
         return False
@@ -1111,7 +1216,7 @@ def _is_diagnostic_refinement_reply(
     text = (current_message or "").strip()
     if not text:
         return False
-    if _is_unresolved_negative_only(text, button_reply_id):
+    if is_unresolved_negative_only(text, button_reply_id):
         return False
     if _is_branch_change_short_reply(text) or _user_switch_reply(text):
         return False
@@ -1130,11 +1235,12 @@ def _current_issue_anchor(
     current = (current_message or "").strip()
     btn = (button_reply_id or "").strip().lower()
 
-    if btn == "not_resolved" or _is_unresolved_negative_only(current, button_reply_id):
+    if btn == "not_resolved" or is_unresolved_negative_only(current, button_reply_id):
         return anchors[-1] if anchors else ""
 
     if _is_diagnostic_refinement_reply(history, current, button_reply_id):
-        return anchors[0] if anchors else ""
+        # Most recent tech issue in this arc — not the first ever in the thread
+        return anchors[-1] if anchors else ""
 
     if _is_substantive_issue_user_message(current, button_reply_id):
         return current[:500]
@@ -1155,7 +1261,7 @@ def _message_follows_diagnostic_in_history(history_slice: list[dict]) -> bool:
         return False
     if "unresolved_diagnostic" in last_source.lower():
         return True
-    from wati.services.unresolved_flow import _looks_like_unresolved_diagnostic
+    from app.services.chat.still_stuck import _looks_like_unresolved_diagnostic
 
     return bool(last_text and _looks_like_unresolved_diagnostic(last_text))
 
@@ -1183,7 +1289,7 @@ def _prior_still_stuck_count_for_anchor(history: list[dict], anchor_text: str) -
                     continue
                 return count
             continue
-        if seen_anchor and _is_unresolved_negative_only(content, ""):
+        if seen_anchor and is_unresolved_negative_only(content, ""):
             count += 1
     return count
 
@@ -1218,8 +1324,8 @@ def resolve_issue_continuity(
             "is_unresolved_followup": False,
         }
 
-    if btn == "not_resolved" or _is_unresolved_negative_only(current, btn):
-        count_anchor = prior_anchors[0] if prior_anchors else anchor
+    if btn == "not_resolved" or is_unresolved_negative_only(current, btn):
+        count_anchor = prior_anchors[-1] if prior_anchors else anchor
         prior_stuck = _prior_still_stuck_count_for_anchor(history, count_anchor)
         depth = min(3, 2 + prior_stuck * 2)
         return {
@@ -1230,7 +1336,7 @@ def resolve_issue_continuity(
         }
 
     if _is_diagnostic_refinement_reply(history, current_message, button_reply_id):
-        primary_anchor = prior_anchors[0] if prior_anchors else anchor
+        primary_anchor = prior_anchors[-1] if prior_anchors else anchor
         primary_sig = (
             _normalize_issue_signature(primary_anchor) if primary_anchor else issue_sig
         )
@@ -1257,7 +1363,7 @@ def resolve_issue_continuity(
         }
 
     if anchor and last_prior_sig and issue_sig == last_prior_sig:
-        unresolved = _is_unresolved_negative_only(current, btn)
+        unresolved = is_unresolved_negative_only(current, btn)
         return {
             "same_issue_as_previous": True,
             "issue_followup_depth": 2 if unresolved else 1,
@@ -1370,6 +1476,22 @@ def _unresolved_diagnostic_reply(
     }
 
 
+def _display_person_name(raw: str) -> str:
+    """Title-case a senior first name for copy (`soham` → `Soham`). Keep emoji nicknames."""
+    s = re.sub(r"\s+", " ", (raw or "").strip())
+    if not s:
+        return ""
+    if sum(1 for c in s if c.isalpha()) < 2:
+        return s
+    parts: list[str] = []
+    for w in s.split():
+        if w[:1].isalpha():
+            parts.append(w[0].upper() + w[1:].lower())
+        else:
+            parts.append(w)
+    return " ".join(parts)
+
+
 def _name_for_thread(db, thread_id: int) -> str:
     thread = db.query(Thread).filter(Thread.id == thread_id).first()
     if not thread:
@@ -1381,7 +1503,7 @@ def _name_for_thread(db, thread_id: int) -> str:
     if not senior or not senior.user_id:
         return ""
     user = db.query(User).filter(User.id == senior.user_id).first()
-    return (user.first_name or "").strip() if user else ""
+    return _display_person_name((user.first_name or "").strip() if user else "")
 
 
 def _infer_runtime_context(
@@ -1518,11 +1640,12 @@ def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
     if topic_raw:
         normalized = " ".join(topic_raw.split())
         normalized = re.sub(
-            r"\b(resolved|fixed|solved|closed|completed|done)\b",
+            r"\b(resolved|fixed|solved|closed|completed|done|recovered)\b",
             "",
             normalized,
             flags=re.IGNORECASE,
         ).strip(" .,-")
+        normalized = re.sub(r"\s+", " ", normalized).strip(" .,-")
         if len(normalized) > 90:
             normalized = normalized[:87].rstrip() + "..."
     snippet = " | ".join(lines_for_snippet)
@@ -1537,6 +1660,7 @@ def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
             context={
                 "issue_topic": normalized,
                 "previous_turns": previous_turns,
+                "customer_name": _name_for_thread(db, thread_id),
             },
         )
         blended = (blended or "").strip()
@@ -1549,7 +1673,13 @@ def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
         prior_welcome_blend = blended.strip()
     else:
         prior_welcome_blend = (
-            dynamic_copy("welcome_back_context", context={"previous_turns": previous_turns})
+            dynamic_copy(
+                "welcome_back_context",
+                context={
+                    "previous_turns": previous_turns,
+                    "customer_name": _name_for_thread(db, thread_id),
+                },
+            )
             or ""
         ).strip()
 
@@ -1562,7 +1692,7 @@ def _prior_thread_snapshot(db, thread_id: int) -> dict[str, str]:
     }
 
 
-async def generate_wati_reply(
+async def generate_reply(
     db,
     thread_id: int,
     current_message_id: int,
@@ -1590,7 +1720,18 @@ async def generate_wati_reply(
     )
 
     os_extraction = turn_meta.get("os_extraction") or {}
-    if on_tech_path and not scam_mode and not os_extraction:
+    pending_user_issue_early = _pending_user_issue_from_history(
+        history, current_message, button_reply_id
+    )
+    if (
+        on_tech_path
+        and not scam_mode
+        and not os_extraction
+        and (
+            pending_user_issue_early
+            or bool(turn_meta.get("unresolved_signal_current_turn"))
+        )
+    ):
         senior = _senior_for_thread(db, thread_id)
         stored_for_extract = _platform_slug_from_senior(db, senior)
         platform_for_os = (
@@ -1633,10 +1774,15 @@ async def generate_wati_reply(
         prior_turns_snippet = snap.get("prior_turns_snippet") or ""
         prior_welcome_blend = snap.get("prior_welcome_blend") or ""
 
-    bank_helpline_url = (settings.BANK_HELPLINE_URL or "").strip()
+    bank_helpline_url = (BANK_HELPLINE_URL or "").strip()
     pending_user_issue = _pending_user_issue_from_history(
         history, current_message, button_reply_id
     )
+    force_fresh_mode_entry = bool(turn_meta.get("force_fresh_mode_entry"))
+    branch_locked = bool(turn_meta.get("branch_locked"))
+    if force_fresh_mode_entry:
+        # Explicit Tech/Scam chip: do not inherit prior episode's issue
+        pending_user_issue = ""
     recent_user_messages = _recent_user_messages_snippet(history)
     known_phone_os = ""
     stored_platform = (runtime_context.get("stored_platform") or "").strip().lower()
@@ -1747,13 +1893,13 @@ async def generate_wati_reply(
             or _is_scam_entry_message(current_message, button_reply_id)
         ):
             entry_text = dynamic_copy(
-                "scam_entry",
+                "scam_story_ask",
                 context={"customer_name": (customer_name or "").strip()},
             )
             return {
                 "kind": "text",
                 "message": entry_text,
-                "message_source": "scam_entry,dynamic_copy",
+                "message_source": "scam_story_ask,dynamic_copy",
             }
 
     messages = _to_langchain_messages(history)
@@ -1789,10 +1935,29 @@ async def generate_wati_reply(
                 f"scam_mode_active: {str(scam_mode).lower()}\n"
                 f"active_branch: {(turn_meta.get('active_branch') or support_mode or 'infer_from_history')}\n"
                 f"pending_user_issue: {pending_user_issue or 'none'}\n"
+                f"force_fresh_mode_entry: {str(force_fresh_mode_entry).lower()}\n"
+                f"explicit_tech_entry: {str(bool(turn_meta.get('explicit_tech_entry'))).lower()}\n"
+                f"platform_confirm_unclear: {str(bool(turn_meta.get('platform_confirm_unclear'))).lower()}\n"
+                f"branch_locked: {str(branch_locked).lower()}\n"
+                f"episode_branch: {(turn_meta.get('episode_branch') or 'none')}\n"
+                f"episode_phase: {(turn_meta.get('episode_phase') or 'none')}\n"
+                f"episode_awaiting: {(turn_meta.get('episode_awaiting') or 'none')}\n"
                 "Before RULE 3: read recent_user_messages and full history — not only latest_user_message.\n"
                 "If the user already described a tech goal or problem in an earlier message and the latest message only selects Tech Help or a phone brand, issue is known: use RULE 2b (search_support_docs); do not ask what issue they are having.\n"
-                "Routing (tech vs scam) is YOUR job via <routing_intelligence> and RULE 0 — read full history every turn.\n"
-                "support_mode / scam_mode_active / active_branch are hints only — if history clearly shows scam safety, follow RULE 0 even when flags were false on a typed-first message.\n"
+                "When force_fresh_mode_entry is true OR branch_locked is true: support_mode / active_branch are AUTHORITATIVE — "
+                "ignore prior scam/tech history for routing this turn; do not continue the previous episode's issue.\n"
+                "When force_fresh_mode_entry is true: treat this as a fresh Tech or Scam intake (ask what happened / platform confirm is code-owned) — "
+                "do not retrieve or troubleshoot a prior issue from history.\n"
+                "When explicit_tech_entry is false and the latest message is greeting-only or mode-ambiguous "
+                "(no clear phone issue and no clear scam story): use RULE 4 (send_mode_buttons). "
+                "Do NOT continue a prior tech episode, ask about stored phone, or invent tech intake — "
+                "support_mode / episode_branch / active_branch from history are hints only.\n"
+                "When platform_confirm_unclear is true: the system asked 'still using your phone?' and the user "
+                "did not clearly say Yes or No. Judge their intent yourself — soft yes/no → continue tech intake; "
+                "greeting / fresh start / new topic → send_mode_buttons; clear phone issue stated → help on that issue. "
+                "Do not blindly re-ask the same Yes/No.\n"
+                "Routing (tech vs scam) is YOUR job via <routing_intelligence> and RULE 0 when branch_locked is false — read full history every turn.\n"
+                "When branch_locked is false: support_mode / scam_mode_active / active_branch are hints — if history clearly shows scam safety on a typed-first message, follow RULE 0.\n"
                 "Never close a scam crisis with a generic 'glad everything is working' line; never send platform_buttons mid-scam.\n"
                 "Mid-conversation branch change (tech ↔ scam): plain text only — ask warmly if they want scam safety or phone help; yes/no or their next message confirms the branch.\n"
                 "After user confirms switching branch: help immediately using pending_user_issue and history — do not re-ask the same question.\n"
@@ -1800,6 +1965,8 @@ async def generate_wati_reply(
                 "FIRST URGENT after OTP/credentials: Step 1 = call bank to block only — NO bank phone number unless user already named that bank in history; never default to HDFC. Closing must offer helpline when they reply with bank name.\n"
                 "Bank helpline follow-up: when user names a bank or asks for number → one line from scam_reference_numbers only; no 1930/complaint in same turn.\n"
                 "When on scam path: plain text only; no send_mode_buttons, send_platform_buttons, send_feedback_buttons, or search_support_docs.\n"
+                "Mid-scam unclear/gibberish: one warm plain-text redirect to what happened — never chip menus "
+                "(no scam-story / phone-problem / talk-to-human option lists).\n"
                 "Scam Help entry (no story yet): system asks phone OS once (iOS/Android buttons) only on scam branch — NEVER on tech branch.\n"
                 "When support_mode or active_branch is tech: never send or reference scam OS buttons; known_phone_os must stay unknown.\n"
                 "When known_phone_os is ios: never suggest APK sideloading or Android-only app install steps; iPhones use App Store only — for fake apps use delete app / Settings > General > iPhone Storage, or remove unknown configuration profiles.\n"
@@ -1811,7 +1978,9 @@ async def generate_wati_reply(
                 "When the user has described their situation: MUST call search_scam_kb first, then <scam_unified_flow> (comfort → category → MO; contextual check — not always money/OTP).\n"
                 "Complaint (1930): plain text REPORT/HOW TO FILE only; end with one warm natural line offering prevention tips (no 'reply yes'). If user clearly wants tips: search_scam_kb(prevention) then PREVENTION in plain text.\n"
                 "Never repeat prior-thread welcome-back text when entering scam help or when the user already described a scam in this thread.\n"
-                "When on scam path and user clearly thanks or says resolved: conversation_control(resolved) + warm close — no mode buttons.\n"
+                "When on scam path and user clearly thanks or says resolved: call conversation_control(resolved) — "
+                "code may still block close if the episode is mid-flow; the system sends warm close + welcome-back + Tech/Scam mode buttons on a new thread when allowed. "
+                "Do NOT send_mode_buttons yourself on that turn.\n"
                 "When on scam path and user asks for human: RULE 7b — brief acknowledgment only.\n"
                 "When fresh_chatbot_thread is true and post_resolve_welcome_sent is true: system already sent prior_welcome_blend + Tech/Scam buttons — do NOT send_mode_buttons or repeat welcome on greeting-only.\n"
                 "When fresh_chatbot_thread is true and post_resolve_welcome_sent is false and greeting-only: prior_welcome_blend may be used in send_mode_buttons (human handoff return).\n"
@@ -1873,7 +2042,9 @@ async def generate_wati_reply(
                     "REWRITTEN troubleshooting steps — guide them side by side like a friend on a call: "
                     "warm optional intro with customer_name, numbered steps (each step = what to do + what "
                     "they should see), one short line on what is different from prior steps, natural check-in. "
-                    "Do NOT copy manual wording. Do NOT call search_support_docs again."
+                    "Do NOT copy manual wording. Do NOT call search_support_docs again. "
+                    "If the issue is Bluetooth speaker/headphones (not hearing aids), NEVER use "
+                    "Hearing Devices or MFi Hearing Devices paths — use Settings > Bluetooth instead."
                 )
             )
         )
@@ -2023,6 +2194,28 @@ async def generate_wati_reply(
                     and (not base_query or len(base_query) < 12)
                 ):
                     base_query = pending_user_issue
+                # Bind retrieval to the continuity issue so an older thread topic cannot win.
+                if (pending_user_issue or "").strip() and len(pending_user_issue.strip()) >= 12:
+                    base_query = pending_user_issue.strip()[:500]
+                issue_l = (base_query or "").lower()
+                if any(
+                    k in issue_l
+                    for k in (
+                        "bluetooth",
+                        "speaker",
+                        "headphone",
+                        "headphones",
+                        "earbuds",
+                        "earbud",
+                    )
+                ) and not any(
+                    k in issue_l for k in ("hearing aid", "hearing aids", "hearing device")
+                ):
+                    base_query = (
+                        f"{base_query}\n"
+                        "Bluetooth speaker or headphones pairing only. "
+                        "Do NOT use Hearing Devices, MFi Hearing Devices, or hearing-aid paths."
+                    )
                 hint_lines = []
                 if retrieval_os:
                     hint_lines.append(f"os_family: {retrieval_os}")
